@@ -72,6 +72,8 @@ namespace {
             {"BLOCK_FRAGMENT_SHADER", "Procedures/Shaders/Block.frag.wgsl"},
             {"FACE_VERTEX_SHADER", "Procedures/Shaders/Face.vert.wgsl"},
             {"FACE_FRAGMENT_SHADER", "Procedures/Shaders/Face.frag.wgsl"},
+            {"OCCLUSION_FACE_VERTEX_SHADER", "Procedures/Shaders/OcclusionFace.vert.wgsl"},
+            {"OCCLUSION_FACE_FRAGMENT_SHADER", "Procedures/Shaders/OcclusionFace.frag.wgsl"},
             {"WATER_VERTEX_SHADER", "Procedures/Shaders/Water.vert.wgsl"},
             {"WATER_FRAGMENT_SHADER", "Procedures/Shaders/Water.frag.wgsl"},
             {"WATER_COMPOSITE_VERTEX_SHADER", "Procedures/Shaders/WaterComposite.vert.wgsl"},

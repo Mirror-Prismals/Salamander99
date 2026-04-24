@@ -28,6 +28,9 @@ namespace RenderInitSystemLogic {
             renderBackend.destroyVertexArray(buffers.opaqueVaos[i]);
             renderBackend.destroyArrayBuffer(buffers.opaqueVBOs[i]);
             buffers.opaqueCounts[i] = 0;
+            renderBackend.destroyVertexArray(buffers.clippedOpaqueVaos[i]);
+            renderBackend.destroyArrayBuffer(buffers.clippedOpaqueVBOs[i]);
+            buffers.clippedOpaqueCounts[i] = 0;
             renderBackend.destroyVertexArray(buffers.alphaVaos[i]);
             renderBackend.destroyArrayBuffer(buffers.alphaVBOs[i]);
             buffers.alphaCounts[i] = 0;
@@ -241,85 +244,6 @@ namespace RenderInitSystemLogic {
     }
 
     namespace {
-        struct FrustumCache {
-            bool valid = false;
-            glm::mat4 lastViewProj{1.0f};
-            std::array<glm::vec4, 6> planes{};
-        };
-
-        void normalizePlane(glm::vec4& plane) {
-            glm::vec3 n(plane.x, plane.y, plane.z);
-            float len = glm::length(n);
-            if (len <= 1e-6f) return;
-            plane /= len;
-        }
-
-        void extractFrustumPlanes(const glm::mat4& viewProj, std::array<glm::vec4, 6>& planes) {
-            // GLM is column-major: reconstruct matrix rows explicitly.
-            glm::vec4 row0(viewProj[0][0], viewProj[1][0], viewProj[2][0], viewProj[3][0]);
-            glm::vec4 row1(viewProj[0][1], viewProj[1][1], viewProj[2][1], viewProj[3][1]);
-            glm::vec4 row2(viewProj[0][2], viewProj[1][2], viewProj[2][2], viewProj[3][2]);
-            glm::vec4 row3(viewProj[0][3], viewProj[1][3], viewProj[2][3], viewProj[3][3]);
-
-            planes[0] = row3 + row0; // left
-            planes[1] = row3 - row0; // right
-            planes[2] = row3 + row1; // bottom
-            planes[3] = row3 - row1; // top
-            planes[4] = row3 + row2; // near
-            planes[5] = row3 - row2; // far
-
-            for (auto& p : planes) normalizePlane(p);
-        }
-
-        bool aabbIntersectsFrustum(const std::array<glm::vec4, 6>& planes,
-                                   const glm::vec3& minB,
-                                   const glm::vec3& maxB,
-                                   float margin) {
-            glm::vec3 expandedMin = minB - glm::vec3(margin);
-            glm::vec3 expandedMax = maxB + glm::vec3(margin);
-            for (const glm::vec4& plane : planes) {
-                glm::vec3 n(plane.x, plane.y, plane.z);
-                glm::vec3 positive(
-                    n.x >= 0.0f ? expandedMax.x : expandedMin.x,
-                    n.y >= 0.0f ? expandedMax.y : expandedMin.y,
-                    n.z >= 0.0f ? expandedMax.z : expandedMin.z
-                );
-                if (glm::dot(n, positive) + plane.w < 0.0f) return false;
-            }
-            return true;
-        }
-
-        bool shouldRenderByFrustum(const BaseSystem& baseSystem,
-                                   const glm::vec3& minB,
-                                   const glm::vec3& maxB) {
-            if (!getRegistryBool(baseSystem, "voxelFrustumCulling", true)) return true;
-            if (!baseSystem.player) return true;
-            const PlayerContext& player = *baseSystem.player;
-
-            static FrustumCache cache;
-            glm::mat4 viewProj = player.projectionMatrix * player.viewMatrix;
-            if (!cache.valid || cache.lastViewProj != viewProj) {
-                cache.lastViewProj = viewProj;
-                extractFrustumPlanes(viewProj, cache.planes);
-                cache.valid = true;
-            }
-            float margin = glm::clamp(getRegistryFloat(baseSystem, "voxelFrustumMargin", 12.0f), 0.0f, 128.0f);
-            return aabbIntersectsFrustum(cache.planes, minB, maxB, margin);
-        }
-    }
-
-    bool shouldRenderVoxelSection(const BaseSystem& baseSystem,
-                                  const VoxelSection& section,
-                                  const glm::vec3& cameraPos) {
-        (void)cameraPos;
-        int scale = 1;
-        glm::vec3 minB3(
-            static_cast<float>(section.coord.x * section.size * scale),
-            static_cast<float>(section.coord.y * section.size * scale),
-            static_cast<float>(section.coord.z * section.size * scale)
-        );
-        glm::vec3 maxB3 = minB3 + glm::vec3(static_cast<float>(section.size * scale));
-        return shouldRenderByFrustum(baseSystem, minB3, maxB3);
     }
 
     void InitializeRenderer(BaseSystem& baseSystem, std::vector<Entity>& prototypes, float dt, PlatformWindowHandle win) {
@@ -359,6 +283,7 @@ namespace RenderInitSystemLogic {
 
         ensureShader(renderer.blockShader, "BLOCK_VERTEX_SHADER", "BLOCK_FRAGMENT_SHADER", "blockShader");
         ensureShader(renderer.faceShader, "FACE_VERTEX_SHADER", "FACE_FRAGMENT_SHADER", "faceShader");
+        ensureShader(renderer.occlusionFaceShader, "OCCLUSION_FACE_VERTEX_SHADER", "OCCLUSION_FACE_FRAGMENT_SHADER", "occlusionFaceShader");
         ensureShader(renderer.waterShader, "WATER_VERTEX_SHADER", "WATER_FRAGMENT_SHADER", "waterShader");
         ensureShader(renderer.waterCompositeShader,
                      "WATER_COMPOSITE_VERTEX_SHADER",
@@ -459,10 +384,17 @@ namespace RenderInitSystemLogic {
              0.5f,  0.5f,  0.0f,  0.0f, 0.0f, 1.0f,  1.0f, 1.0f,
             -0.5f,  0.5f,  0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 1.0f
         };
+        float clippedFaceVerts[] = {
+            -0.5f, -0.5f,  0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 0.0f,
+             1.5f, -0.5f,  0.0f,  0.0f, 0.0f, 1.0f,  2.0f, 0.0f,
+            -0.5f,  1.5f,  0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 2.0f
+        };
         renderBackend.ensureVertexArray(renderer.faceVAO);
         renderBackend.ensureArrayBuffer(renderer.faceVBO);
+        renderBackend.ensureArrayBuffer(renderer.faceClippedVBO);
         renderBackend.ensureArrayBuffer(renderer.faceInstanceVBO);
         renderBackend.uploadArrayBufferData(renderer.faceVBO, faceVerts, sizeof(faceVerts), false);
+        renderBackend.uploadArrayBufferData(renderer.faceClippedVBO, clippedFaceVerts, sizeof(clippedFaceVerts), false);
         renderBackend.configureVertexArray(
             renderer.faceVAO,
             renderer.faceVBO,
@@ -699,6 +631,7 @@ namespace RenderInitSystemLogic {
         renderBackend.destroyArrayBuffer(renderer.audioRayVoxelInstanceVBO);
         renderBackend.destroyVertexArray(renderer.faceVAO);
         renderBackend.destroyArrayBuffer(renderer.faceVBO);
+        renderBackend.destroyArrayBuffer(renderer.faceClippedVBO);
         renderBackend.destroyArrayBuffer(renderer.faceInstanceVBO);
         auto destroyTexture = [&](RenderHandle& texture) {
             if (!texture) return;
@@ -723,6 +656,7 @@ namespace RenderInitSystemLogic {
         renderer.terrainTextureCount = 0;
         destroyTexture(renderer.waterOverlayTexture);
         renderBackend.destroyColorRenderTarget(renderer.godrayOcclusionFBO, renderer.godrayOcclusionTex);
+        renderBackend.destroyColorRenderTarget(renderer.occlusionHzbFBO, renderer.occlusionHzbTex);
         renderBackend.destroyColorRenderTarget(renderer.godrayBlurFBO, renderer.godrayBlurTex);
         renderBackend.destroyColorRenderTarget(renderer.waterReflectionFBO, renderer.waterReflectionTex);
         renderBackend.destroyColorRenderTarget(renderer.waterSceneFBO, renderer.waterSceneTex);
@@ -731,6 +665,8 @@ namespace RenderInitSystemLogic {
         renderer.waterReflectionHeight = 0;
         renderer.waterSceneWidth = 0;
         renderer.waterSceneHeight = 0;
+        renderer.occlusionHzbWidth = 0;
+        renderer.occlusionHzbHeight = 0;
 
         renderer.blockShader.reset();
         renderer.skyboxShader.reset();
@@ -741,6 +677,7 @@ namespace RenderInitSystemLogic {
         renderer.crosshairShader.reset();
         renderer.colorEmotionShader.reset();
         renderer.faceShader.reset();
+        renderer.occlusionFaceShader.reset();
         renderer.waterShader.reset();
         renderer.waterCompositeShader.reset();
         renderer.fontShader.reset();

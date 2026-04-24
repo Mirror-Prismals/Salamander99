@@ -276,6 +276,9 @@ struct VoxelFaceRenderBuffers {
     std::array<RenderHandle, 6> opaqueVaos{};
     std::array<RenderHandle, 6> opaqueVBOs{};
     std::array<int, 6> opaqueCounts{};
+    std::array<RenderHandle, 6> clippedOpaqueVaos{};
+    std::array<RenderHandle, 6> clippedOpaqueVBOs{};
+    std::array<int, 6> clippedOpaqueCounts{};
     std::array<RenderHandle, 6> alphaVaos{};
     std::array<RenderHandle, 6> alphaVBOs{};
     std::array<int, 6> alphaCounts{};
@@ -297,11 +300,181 @@ struct ChunkRenderBuffers {
     bool usesTexturedFaceBuffers = false;
     bool builtWithFaceCulling = false;
 };
+struct VoxelRenderCluster {
+    ChunkRenderBuffers buffers{};
+    glm::vec3 minBounds = glm::vec3(0.0f);
+    glm::vec3 maxBounds = glm::vec3(0.0f);
+};
+struct OcclusionAabbKey {
+    int minX2 = 0;
+    int minY2 = 0;
+    int minZ2 = 0;
+    int maxX2 = 0;
+    int maxY2 = 0;
+    int maxZ2 = 0;
+
+    bool operator==(const OcclusionAabbKey& other) const noexcept {
+        return minX2 == other.minX2
+            && minY2 == other.minY2
+            && minZ2 == other.minZ2
+            && maxX2 == other.maxX2
+            && maxY2 == other.maxY2
+            && maxZ2 == other.maxZ2;
+    }
+};
+
+struct OcclusionAabbKeyHash {
+    std::size_t operator()(const OcclusionAabbKey& key) const noexcept {
+        std::size_t h = std::hash<int>()(key.minX2);
+        h ^= std::hash<int>()(key.minY2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+        h ^= std::hash<int>()(key.minZ2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+        h ^= std::hash<int>()(key.maxX2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+        h ^= std::hash<int>()(key.maxY2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+        h ^= std::hash<int>()(key.maxZ2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+        return h;
+    }
+};
 struct VoxelRenderContext {
     std::unordered_map<VoxelSectionKey, ChunkRenderBuffers, VoxelSectionKeyHash> renderBuffers;
+    std::unordered_map<VoxelSectionKey, std::vector<VoxelRenderCluster>, VoxelSectionKeyHash> renderClusters;
     std::unordered_map<VoxelSectionKey, PreparedVoxelSectionMesh, VoxelSectionKeyHash> preparedMeshes;
+    std::unordered_map<VoxelSectionKey, PreparedVoxelSectionMesh, VoxelSectionKeyHash> wireframeMeshes;
     std::unordered_set<VoxelSectionKey, VoxelSectionKeyHash> renderBuffersDirty;
+    size_t wireframeOverlayNearFaces = 0;
+    size_t wireframeOverlayFarFaces = 0;
+    size_t wireframeOverlayLineSegments = 0;
     bool initialized = false;
+};
+struct FarTerrainCachedCell {
+    int x = 0;
+    int z = 0;
+    int size = 1;
+    int topY = 0;
+    int lodRing = 0;
+    const char* prototypeName = "GrassBlockTex";
+    const char* sidePrototypeName = "DirtBlockTex";
+    const char* deepPrototypeName = "StoneBlockTex";
+    glm::vec3 fallbackColor = glm::vec3(0.35f, 0.62f, 0.22f);
+    glm::vec3 sideFallbackColor = glm::vec3(0.35f, 0.24f, 0.14f);
+    glm::vec3 deepFallbackColor = glm::vec3(0.28f, 0.24f, 0.20f);
+};
+struct FarTerrainClipmapContext {
+    bool enabled = false;
+    bool initialized = false;
+    bool lastBuildSkipped = false;
+    glm::ivec2 anchorCell{0};
+    int baseCellSize = 16;
+    int nearRadiusBlocks = 160;
+    int maxRadiusBlocks = 2048;
+    int ringCount = 4;
+    uint64_t rebuildCount = 0;
+    uint64_t lastBuildFrame = 0;
+    size_t visibleFaceCount = 0;
+    uint64_t lastBoundaryCoverageSignature = 0;
+    size_t handoffVisibleFaceCount = 0;
+    size_t bodyVisibleFaceCount = 0;
+    size_t lastLandCellCount = 0;
+    size_t lastHandoffCellCount = 0;
+    size_t lastBodyCellCount = 0;
+    size_t lastSuppressedCellCount = 0;
+    bool lastFullRebuild = false;
+    bool lastHandoffRefresh = false;
+    bool boundsDebugEnabled = false;
+    int visibleRingCount = 0;
+    bool lastParamsChanged = false;
+    bool lastAnchorChanged = false;
+    bool lastCoverageChanged = false;
+    bool lastPeriodicRefreshDue = false;
+    bool lastViewBucketChanged = false;
+    int lastAnchorDeltaX = 0;
+    int lastAnchorDeltaZ = 0;
+    int lastViewYawBucket = std::numeric_limits<int>::min();
+    int lastViewPitchBucket = std::numeric_limits<int>::min();
+    float lastUpdateMs = 0.0f;
+    float lastSetupMs = 0.0f;
+    float lastBodyBuildMs = 0.0f;
+    float lastHandoffBuildMs = 0.0f;
+    float lastUploadMs = 0.0f;
+    float lastCellResolveMs = 0.0f;
+    float lastTopGreedyMs = 0.0f;
+    float lastTopMergeMs = 0.0f;
+    float lastVerticalBuildMs = 0.0f;
+    float lastClusterPrepMs = 0.0f;
+    float lastClusterUploadMs = 0.0f;
+    uint64_t uploadOnlyCount = 0;
+    uint64_t handoffRefreshCount = 0;
+    uint64_t handoffRefreshByCoverageCount = 0;
+    uint64_t handoffRefreshByPeriodicCount = 0;
+    uint64_t fullRebuildByParamsCount = 0;
+    uint64_t fullRebuildByAnchorCount = 0;
+    uint64_t fullRebuildByCoverageCount = 0;
+    uint64_t fullRebuildByViewCount = 0;
+    size_t sectorRingTests = 0;
+    size_t sectorRingRejected = 0;
+    size_t sectorCellTests = 0;
+    size_t sectorCellRejected = 0;
+    size_t frustumRingTests = 0;
+    size_t frustumRingRejected = 0;
+    size_t frustumCellTests = 0;
+    size_t frustumCellRejected = 0;
+    std::array<size_t, 10> lodCellCounts{};
+    std::array<size_t, 10> lodFaceCounts{};
+    std::array<size_t, 10> lodTriangleCounts{};
+    std::unordered_map<uint64_t, FarTerrainCachedCell> resolvedCellCache;
+    std::vector<FarTerrainCachedCell> handoffCells;
+    std::vector<FarTerrainCachedCell> bodyCells;
+    std::array<std::vector<FaceInstanceRenderData>, 6> handoffFaces;
+    std::array<std::vector<FaceInstanceRenderData>, 6> bodyFaces;
+    std::vector<VoxelRenderCluster> handoffRenderClusters;
+    std::vector<VoxelRenderCluster> bodyRenderClusters;
+    ChunkRenderBuffers handoffRenderBuffers{};
+    ChunkRenderBuffers bodyRenderBuffers{};
+    bool handoffRenderBuffersValid = false;
+    bool handoffRenderBuffersDirty = false;
+    bool bodyRenderBuffersValid = false;
+    bool bodyRenderBuffersDirty = false;
+};
+struct OcclusionCullingContext {
+    bool enabled = true;
+    bool debugFrozen = false;
+    bool frozenValid = false;
+    bool hzbValid = false;
+    uint64_t lastBuildFrame = 0;
+    glm::vec3 lastCameraPosition = glm::vec3(0.0f);
+    float keepNearRadius = 0.0f;
+    size_t testedSectionCount = 0;
+    size_t visibleSectionCount = 0;
+    size_t occludedSectionCount = 0;
+    size_t nearKeptSectionCount = 0;
+    size_t frustumRejectedSectionCount = 0;
+    size_t farTestedCount = 0;
+    size_t farOccludedCount = 0;
+    size_t hzbOccluderClusterCount = 0;
+    float hzbCaptureMs = 0.0f;
+    float hzbReadbackMs = 0.0f;
+    float hzbBuildMs = 0.0f;
+    float hzbQueryMs = 0.0f;
+    std::array<float, 128> azimuthHorizon{};
+    std::unordered_set<OcclusionAabbKey, OcclusionAabbKeyHash> occludedClusterBounds;
+    std::unordered_set<VoxelSectionKey, VoxelSectionKeyHash> occludedVoxelSections;
+    std::vector<float> hzbBaseDepth;
+    std::vector<std::vector<float>> hzbMipLevels;
+    std::vector<glm::ivec2> hzbMipSizes;
+};
+struct FrustumCullingContext {
+    bool enabled = true;
+    bool valid = false;
+    bool debugFrozen = false;
+    bool frozenValid = false;
+    glm::mat4 lastViewProj = glm::mat4(1.0f);
+    glm::mat4 frozenViewProj = glm::mat4(1.0f);
+    std::array<glm::vec4, 6> planes{};
+    std::array<glm::vec4, 6> frozenPlanes{};
+    float margin = 12.0f;
+    glm::vec3 frozenCameraPosition = glm::vec3(0.0f);
+    glm::vec3 frozenPrevCameraPosition = glm::vec3(0.0f);
+    float frozenCameraYaw = -90.0f;
+    float frozenCameraPitch = 0.0f;
 };
 struct PlayerContext {
     float cameraYaw=-90.0f;
@@ -421,6 +594,7 @@ struct MiniVoxelParticle {
 struct RendererContext {
     std::unique_ptr<Shader> blockShader, skyboxShader, sunMoonShader, starShader, selectionShader, hudShader, crosshairShader, colorEmotionShader;
     std::unique_ptr<Shader> faceShader;
+    std::unique_ptr<Shader> occlusionFaceShader;
     std::unique_ptr<Shader> waterShader;
     std::unique_ptr<Shader> waterCompositeShader;
     std::unique_ptr<Shader> fontShader;
@@ -429,6 +603,7 @@ struct RendererContext {
     std::vector<RenderHandle> behaviorInstanceVBOs;
     RenderHandle faceVAO = 0;
     RenderHandle faceVBO = 0;
+    RenderHandle faceClippedVBO = 0;
     RenderHandle faceInstanceVBO = 0;
     RenderHandle skyboxVAO, skyboxVBO, sunMoonVAO, sunMoonVBO, starVAO, starVBO;
     RenderHandle selectionVAO = 0;
@@ -488,6 +663,8 @@ struct RendererContext {
     RenderHandle godrayQuadVBO = 0;
     RenderHandle godrayOcclusionFBO = 0;
     RenderHandle godrayOcclusionTex = 0;
+    RenderHandle occlusionHzbFBO = 0;
+    RenderHandle occlusionHzbTex = 0;
     RenderHandle godrayBlurFBO = 0;
     RenderHandle godrayBlurTex = 0;
     RenderHandle waterReflectionFBO = 0;
@@ -506,6 +683,8 @@ struct RendererContext {
     int godrayWidth = 0;
     int godrayHeight = 0;
     int godrayDownsample = 2;
+    int occlusionHzbWidth = 0;
+    int occlusionHzbHeight = 0;
     std::vector<MiniVoxelParticle> miniVoxelParticles;
     // Clouds
     RenderHandle cloudVAO = 0;
@@ -1654,6 +1833,9 @@ struct BaseSystem {
     std::unique_ptr<WorldContext> world;
     std::unique_ptr<VoxelWorldContext> voxelWorld;
     std::unique_ptr<VoxelRenderContext> voxelRender;
+    std::unique_ptr<FarTerrainClipmapContext> farTerrain;
+    std::unique_ptr<FrustumCullingContext> frustumCulling;
+    std::unique_ptr<OcclusionCullingContext> occlusionCulling;
     std::unique_ptr<PlayerContext> player;
     std::unique_ptr<InstanceContext> instance;
     std::unique_ptr<RendererContext> renderer;
@@ -1736,8 +1918,30 @@ namespace RenderInitSystemLogic { void InitializeRenderer(BaseSystem&, std::vect
 namespace VoxelMeshInitSystemLogic { void UpdateVoxelMeshInit(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
 namespace VoxelLightingSystemLogic { void UpdateVoxelLighting(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
 namespace VoxelMeshingSystemLogic { void UpdateVoxelMeshing(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); void ResetMeshingRuntime(); }
-namespace VoxelMeshUploadSystemLogic { void UpdateVoxelMeshUpload(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
+namespace VoxelMeshUploadSystemLogic {
+    void UpdateVoxelMeshUpload(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
+    bool UploadPreparedVoxelSectionMesh(const PreparedVoxelSectionMesh&, ChunkRenderBuffers&, RendererContext&, IRenderBackend&);
+}
 namespace VoxelMeshDebugSystemLogic { void UpdateVoxelMeshDebug(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
+namespace FarTerrainClipmapSystemLogic { void UpdateFarTerrainClipmap(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
+namespace FrustumCullingSystemLogic {
+    void UpdateFrustumCulling(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
+    bool ShouldRenderWorldAabb(const BaseSystem&, const glm::vec3&, const glm::vec3&);
+    bool ShouldRenderVoxelSection(const BaseSystem&, const VoxelSection&);
+    void SetDebugFrozen(BaseSystem&, bool);
+    bool IsDebugFrozen(const BaseSystem&);
+    glm::vec3 GetCullingCameraPosition(const BaseSystem&);
+    glm::vec3 GetCullingPreviousCameraPosition(const BaseSystem&);
+    float GetCullingCameraYaw(const BaseSystem&);
+    float GetCullingCameraPitch(const BaseSystem&);
+}
+namespace OcclusionCullingSystemLogic {
+    void UpdateOcclusionCulling(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
+    bool IsVoxelSectionOccluded(const BaseSystem&, const VoxelSectionKey&);
+    bool IsWorldAabbOccluded(const BaseSystem&, const glm::vec3&, const glm::vec3&);
+    void SetDebugFrozen(BaseSystem&, bool);
+    bool IsDebugFrozen(const BaseSystem&);
+}
 namespace WorldRenderSystemLogic { void RenderWorld(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
 namespace MiniVoxelParticleSystemLogic {
     void SpawnFromBlock(BaseSystem& baseSystem,
@@ -1753,6 +1957,11 @@ namespace MiniVoxelParticleSystemLogic {
                          std::array<std::vector<FaceInstanceRenderData>, 6>& faceInstances);
 }
 namespace OverlayRenderSystemLogic { void RenderOverlays(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
+namespace ExpanseBiomeSystemLogic {
+    void LoadExpanseConfig(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
+    bool SampleTerrain(const WorldContext&, float, float, float&);
+    int ResolveBiome(const WorldContext&, float, float);
+}
 namespace LeyLineSystemLogic { void LoadLeyLines(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); float SampleLeyStress(const WorldContext&, float, float); float SampleLeyUplift(const WorldContext&, float, float); }
 namespace TerrainSystemLogic {
     void GenerateTerrain(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
@@ -1778,6 +1987,7 @@ namespace TerrainSystemLogic {
 namespace TreeGenerationSystemLogic {
     void UpdateExpanseTrees(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle);
     void RequestImmediateSectionFoliage(const VoxelSectionKey& key);
+    void SetForceCompleteSectionFoliageTargets(const std::vector<VoxelSectionKey>& keys);
     void ProcessImmediateSectionFoliage(BaseSystem& baseSystem,
                                         std::vector<Entity>& prototypes,
                                         int maxPasses);
@@ -1927,7 +2137,7 @@ namespace PianoRollResourceSystemLogic { void UpdatePianoRollResources(BaseSyste
 namespace PianoRollLayoutSystemLogic { void UpdatePianoRollLayout(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
 namespace PianoRollInputSystemLogic { void UpdatePianoRollInput(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
 namespace PianoRollRenderSystemLogic { void UpdatePianoRollRender(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }
-namespace SkyboxSystemLogic { void getCurrentSkyColors(float, const std::vector<SkyColorKey>&, glm::vec3&, glm::vec3&); void RenderSkyAndCelestials(BaseSystem&, const std::vector<Entity>&, const std::vector<glm::vec3>&, float, float, const glm::mat4&, const glm::mat4&, const glm::vec3&, glm::vec3&); }
+namespace SkyboxSystemLogic { void getCurrentSkyColors(float, const std::vector<SkyColorKey>&, glm::vec3&, glm::vec3&); void getCurrentSkyColors(const BaseSystem&, float, const std::vector<SkyColorKey>&, glm::vec3&, glm::vec3&); void RenderSkyAndCelestials(BaseSystem&, const std::vector<Entity>&, const std::vector<glm::vec3>&, float, float, const glm::mat4&, const glm::mat4&, const glm::vec3&, glm::vec3&); }
 namespace CloudSystemLogic { void RenderClouds(BaseSystem&, const glm::vec3& lightDir, float time, float dayFraction); }
 namespace AuroraSystemLogic { void RenderAuroras(BaseSystem&, float time, const glm::mat4& view, const glm::mat4& projection); }
 namespace BlockTextureSystemLogic { void LoadBlockTextures(BaseSystem&, std::vector<Entity>&, float, PlatformWindowHandle); }

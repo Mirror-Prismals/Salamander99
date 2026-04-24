@@ -40,7 +40,14 @@ namespace TerrainSystemLogic {
                                     int& droppedByCap,
                                     int& reprioritized,
                                     float& prepMs,
-                                    float& generationMs);
+                                    float& generationMs,
+                                    float& desiredMs,
+                                    float& baseGenMs,
+                                    float& featureMs,
+                                    float& surfaceMs,
+                                    float& caveFieldMs,
+                                    uint64_t& caveFieldCellsBuilt,
+                                    uint64_t& caveSamples);
 }
 namespace VoxelMeshingSystemLogic { void RequestPriorityVoxelRemesh(BaseSystem& baseSystem, std::vector<Entity>& prototypes, const glm::ivec3& worldCell); }
 
@@ -1009,10 +1016,21 @@ namespace TreeGenerationSystemLogic {
         }
     }
 
+    void SetForceCompleteSectionFoliageTargets(const std::vector<VoxelSectionKey>& keys) {
+        g_treeForceCompleteSections.clear();
+        for (const VoxelSectionKey& key : keys) {
+            g_treeForceCompleteSections.insert(key);
+        }
+    }
+
     bool IsSectionSurfaceFoliageReady(const BaseSystem& baseSystem, const VoxelSectionKey& key) {
         if (!baseSystem.voxelWorld) return false;
         const auto sectionIt = baseSystem.voxelWorld->sections.find(key);
         if (sectionIt == baseSystem.voxelWorld->sections.end()) return false;
+        const VoxelChunkLifecycleState* state = baseSystem.voxelWorld->findChunkState(key);
+        if (state && state->surfaceFoliageComplete) {
+            return true;
+        }
         if (g_treePendingSections.count(key) > 0) return false;
         if (g_treePendingDependencies.count(key) > 0) return false;
         if (g_treeSectionProgress.count(key) > 0) return false;
@@ -1750,6 +1768,13 @@ namespace TreeGenerationSystemLogic {
             int terrainRescueSurface = 0, terrainRescueMissing = 0, terrainCapDrop = 0, terrainReprio = 0;
             float terrainPrepMs = 0.0f;
             float terrainGenMs = 0.0f;
+            float terrainDesiredMs = 0.0f;
+            float terrainBaseMs = 0.0f;
+            float terrainFeatureMs = 0.0f;
+            float terrainSurfaceMs = 0.0f;
+            float terrainCaveFieldMs = 0.0f;
+            uint64_t terrainCaveFieldCellsBuilt = 0;
+            uint64_t terrainCaveSamples = 0;
             TerrainSystemLogic::GetVoxelStreamingPerfStats(
                 terrainPending,
                 terrainDesired,
@@ -1765,7 +1790,14 @@ namespace TreeGenerationSystemLogic {
                 terrainCapDrop,
                 terrainReprio,
                 terrainPrepMs,
-                terrainGenMs
+                terrainGenMs,
+                terrainDesiredMs,
+                terrainBaseMs,
+                terrainFeatureMs,
+                terrainSurfaceMs,
+                terrainCaveFieldMs,
+                terrainCaveFieldCellsBuilt,
+                terrainCaveSamples
             );
             (void)terrainDesired;
             (void)terrainGenerated;
@@ -1780,6 +1812,13 @@ namespace TreeGenerationSystemLogic {
             (void)terrainReprio;
             (void)terrainPrepMs;
             (void)terrainGenMs;
+            (void)terrainDesiredMs;
+            (void)terrainBaseMs;
+            (void)terrainFeatureMs;
+            (void)terrainSurfaceMs;
+            (void)terrainCaveFieldMs;
+            (void)terrainCaveFieldCellsBuilt;
+            (void)terrainCaveSamples;
             const bool throttleByTerrainBacklog = getRegistryBool(baseSystem, "TreeFoliageThrottleByTerrainBacklog", true);
             const int terrainPendingThreshold = std::max(0, getRegistryInt(baseSystem, "TreeFoliageTerrainPendingThreshold", 4096));
             const int terrainJobsThreshold = std::max(0, getRegistryInt(baseSystem, "TreeFoliageTerrainJobsThreshold", 24));
@@ -2217,6 +2256,16 @@ namespace TreeGenerationSystemLogic {
                     enqueueCaveDecorContinuation(key);
                 }
                 deferredByTimeBudget += 1;
+            };
+            auto markSurfaceReadyIfComplete = [&]() {
+                if (unresolvedDependencies) return;
+                VoxelChunkLifecycleState* statePtr = voxelWorld.findChunkState(key);
+                if (statePtr && statePtr->surfaceFoliageComplete) return;
+                auto currentSectionIt = voxelWorld.sections.find(key);
+                if (currentSectionIt != voxelWorld.sections.end()) {
+                    g_treeSurfaceAppliedVersion[key] = currentSectionIt->second.editVersion;
+                }
+                updateSurfaceFoliageLifecycle(key, true);
             };
             auto runGroundFoliagePass = [&]() {
                 writeGroundFoliageToSection(
@@ -2690,6 +2739,7 @@ namespace TreeGenerationSystemLogic {
                     }
                     commitTouchedSections();
                     progress.phase = 5;
+                    markSurfaceReadyIfComplete();
                     if (sectionTimeExceeded()) {
                         deferSection();
                         finishedSection = true;
@@ -2697,6 +2747,15 @@ namespace TreeGenerationSystemLogic {
                     }
                 }
 
+                if (progress.phase >= 5) {
+                    markSurfaceReadyIfComplete();
+                }
+                if (forceCompleteSection && caveDecorSectionEligible && progress.phase <= 5) {
+                    progress.phase = std::max(progress.phase, 5);
+                    deferSection();
+                    finishedSection = true;
+                    continue;
+                }
                 bool allowCaveDecorForSection = caveDecorSectionEligible;
                 if (!forceCompleteSection && allowCaveDecorForSection && caveDecorSectionBudget >= 0) {
                     if (caveDecorSectionBudget == 0 || caveDecorSectionsProcessed >= caveDecorSectionBudget) {

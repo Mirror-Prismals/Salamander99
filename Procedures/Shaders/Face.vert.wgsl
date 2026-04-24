@@ -52,8 +52,9 @@ struct VSOut {
     @location(5) instanceCell: vec3<f32>,
     @location(6) @interpolate(flat) tileIndex: i32,
     @location(7) alpha: f32,
-    @location(8) ao: f32,
+    @location(8) aoCorners: vec4<f32>,
     @location(9) screenUv: vec2<f32>,
+    @location(10) localRectUv: vec2<f32>,
 };
 
 fn rotateY(v: vec3<f32>, r: f32) -> vec3<f32> {
@@ -476,11 +477,7 @@ fn vs_main(input: VSIn) -> VSOut {
     out.normal = normalize((u.model * vec4<f32>(normal, 0.0)).xyz);
     out.tileIndex = input.tileIndex;
     out.alpha = input.alpha;
-
-    if (baseTex.x < 0.5) {
-        out.ao = select(input.ao.w, input.ao.x, baseTex.y < 0.5);
-    } else {
-        out.ao = select(input.ao.z, input.ao.y, baseTex.y < 0.5);
-    }
+    out.aoCorners = input.ao;
+    out.localRectUv = baseTex;
     return out;
 }

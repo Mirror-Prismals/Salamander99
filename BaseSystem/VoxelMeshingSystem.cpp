@@ -21,9 +21,6 @@ namespace VoxelMeshInitSystemLogic {
 namespace RenderInitSystemLogic {
     bool getRegistryBool(const BaseSystem& baseSystem, const std::string& key, bool fallback);
     float getRegistryFloat(const BaseSystem& baseSystem, const std::string& key, float fallback);
-    bool shouldRenderVoxelSection(const BaseSystem& baseSystem,
-                                  const VoxelSection& section,
-                                  const glm::vec3& cameraPos);
 }
 namespace VoxelMeshUploadSystemLogic {
     std::vector<VoxelMeshingPrototypeTraits> BuildVoxelMeshingPrototypeTraits(const BaseSystem& baseSystem,
@@ -386,6 +383,7 @@ namespace VoxelMeshingSystemLogic {
             auto sectionIt = voxelWorld.sections.find(result.key);
             if (sectionIt == voxelWorld.sections.end() || sectionIt->second.nonAirCount <= 0) {
                 voxelRender.preparedMeshes.erase(result.key);
+                voxelRender.wireframeMeshes.erase(result.key);
                 voxelRender.renderBuffersDirty.erase(result.key);
                 voxelWorld.clearSectionDirty(result.key);
                 continue;
@@ -394,6 +392,7 @@ namespace VoxelMeshingSystemLogic {
             const uint64_t currentTicket = voxelWorld.getSectionDirtyTicket(result.key);
             if (currentTicket == 0 || currentTicket != result.mesh.dirtyTicket) {
                 voxelRender.preparedMeshes.erase(result.key);
+                voxelRender.wireframeMeshes.erase(result.key);
                 continue;
             }
             if (!isRenderableSection(voxelWorld, result.key)) {
@@ -408,7 +407,6 @@ namespace VoxelMeshingSystemLogic {
             VoxelSectionKey key;
             uint64_t dirtyTicket = 0;
             float dist2 = 0.0f;
-            bool visible = false;
         };
 
         const glm::vec3 cameraPos = baseSystem.player
@@ -443,19 +441,18 @@ namespace VoxelMeshingSystemLogic {
             candidates.push_back({
                 key,
                 dirtyTicket,
-                keyDist2ToCamera(voxelWorld, key, cameraPos),
-                ::RenderInitSystemLogic::shouldRenderVoxelSection(baseSystem, sectionIt->second, cameraPos)
+                keyDist2ToCamera(voxelWorld, key, cameraPos)
             });
         }
 
         for (const VoxelSectionKey& key : missingSections) {
             voxelRender.preparedMeshes.erase(key);
+            voxelRender.wireframeMeshes.erase(key);
             voxelRender.renderBuffersDirty.erase(key);
             voxelWorld.clearSectionDirty(key);
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.visible != b.visible) return a.visible && !b.visible;
             if (a.dist2 != b.dist2) return a.dist2 < b.dist2;
             if (a.key.coord.x != b.key.coord.x) return a.key.coord.x < b.key.coord.x;
             if (a.key.coord.y != b.key.coord.y) return a.key.coord.y < b.key.coord.y;
@@ -469,6 +466,7 @@ namespace VoxelMeshingSystemLogic {
             auto sectionIt = voxelWorld.sections.find(candidate.key);
             if (sectionIt == voxelWorld.sections.end() || sectionIt->second.nonAirCount <= 0) {
                 voxelRender.preparedMeshes.erase(candidate.key);
+                voxelRender.wireframeMeshes.erase(candidate.key);
                 voxelRender.renderBuffersDirty.erase(candidate.key);
                 voxelWorld.clearSectionDirty(candidate.key);
                 continue;

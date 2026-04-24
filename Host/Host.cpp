@@ -165,6 +165,7 @@ namespace {
             "UpdateVoxelMeshing",
             "UpdateVoxelMeshUpload",
             "UpdateVoxelMeshDebug",
+            "UpdateFarTerrainClipmap",
             "UpdatePerf"
         };
         return kHeadlessUpdateAllowlist.count(stepName) > 0;
@@ -190,9 +191,10 @@ namespace {
             const char* vertexKey = nullptr;
             const char* fragmentKey = nullptr;
         };
-        const std::array<ShaderBinding, 19> bindings = {{
+        const std::array<ShaderBinding, 20> bindings = {{
             {"blockShader", &renderer.blockShader, "BLOCK_VERTEX_SHADER", "BLOCK_FRAGMENT_SHADER"},
             {"faceShader", &renderer.faceShader, "FACE_VERTEX_SHADER", "FACE_FRAGMENT_SHADER"},
+            {"occlusionFaceShader", &renderer.occlusionFaceShader, "OCCLUSION_FACE_VERTEX_SHADER", "OCCLUSION_FACE_FRAGMENT_SHADER"},
             {"waterShader", &renderer.waterShader, "WATER_VERTEX_SHADER", "WATER_FRAGMENT_SHADER"},
             {"waterCompositeShader", &renderer.waterCompositeShader, "WATER_COMPOSITE_VERTEX_SHADER", "WATER_COMPOSITE_FRAGMENT_SHADER"},
             {"skyboxShader", &renderer.skyboxShader, "SKYBOX_VERTEX_SHADER", "SKYBOX_FRAGMENT_SHADER"},
@@ -345,6 +347,9 @@ void Host::registerSystemFunctions() {
     functionRegistry["UpdateVoxelMeshing"] = VoxelMeshingSystemLogic::UpdateVoxelMeshing;
     functionRegistry["UpdateVoxelMeshUpload"] = VoxelMeshUploadSystemLogic::UpdateVoxelMeshUpload;
     functionRegistry["UpdateVoxelMeshDebug"] = VoxelMeshDebugSystemLogic::UpdateVoxelMeshDebug;
+    functionRegistry["UpdateFarTerrainClipmap"] = FarTerrainClipmapSystemLogic::UpdateFarTerrainClipmap;
+    functionRegistry["UpdateFrustumCulling"] = FrustumCullingSystemLogic::UpdateFrustumCulling;
+    functionRegistry["UpdateOcclusionCulling"] = OcclusionCullingSystemLogic::UpdateOcclusionCulling;
     functionRegistry["RenderWorld"] = WorldRenderSystemLogic::RenderWorld;
     functionRegistry["RenderWater"] = WaterRenderSystemLogic::RenderWater;
     functionRegistry["RenderOverlays"] = OverlayRenderSystemLogic::RenderOverlays;
@@ -459,6 +464,9 @@ void Host::init() {
     baseSystem.world = std::make_unique<WorldContext>();
     baseSystem.voxelWorld = std::make_unique<VoxelWorldContext>();
     baseSystem.voxelRender = std::make_unique<VoxelRenderContext>();
+    baseSystem.farTerrain = std::make_unique<FarTerrainClipmapContext>();
+    baseSystem.frustumCulling = std::make_unique<FrustumCullingContext>();
+    baseSystem.occlusionCulling = std::make_unique<OcclusionCullingContext>();
     baseSystem.player = std::make_unique<PlayerContext>();
     baseSystem.instance = std::make_unique<InstanceContext>();
     baseSystem.renderer = std::make_unique<RendererContext>();
@@ -629,6 +637,23 @@ void Host::reloadLevel(const std::string& levelName) {
     // Reset per-level caches/contexts.
     if (baseSystem.voxelWorld) baseSystem.voxelWorld = std::make_unique<VoxelWorldContext>();
     if (baseSystem.voxelRender) baseSystem.voxelRender = std::make_unique<VoxelRenderContext>();
+    if (baseSystem.farTerrain && baseSystem.renderBackend) {
+        if (baseSystem.farTerrain->handoffRenderBuffersValid) {
+            RenderInitSystemLogic::DestroyChunkRenderBuffers(
+                baseSystem.farTerrain->handoffRenderBuffers,
+                *baseSystem.renderBackend
+            );
+        }
+        if (baseSystem.farTerrain->bodyRenderBuffersValid) {
+            RenderInitSystemLogic::DestroyChunkRenderBuffers(
+                baseSystem.farTerrain->bodyRenderBuffers,
+                *baseSystem.renderBackend
+            );
+        }
+    }
+    if (baseSystem.farTerrain) baseSystem.farTerrain = std::make_unique<FarTerrainClipmapContext>();
+    if (baseSystem.frustumCulling) baseSystem.frustumCulling = std::make_unique<FrustumCullingContext>();
+    if (baseSystem.occlusionCulling) baseSystem.occlusionCulling = std::make_unique<OcclusionCullingContext>();
     if (baseSystem.voxelWorld) {
         auto readRegistryInt = [&](const char* key, int fallback) {
             auto it = registry.find(key);

@@ -833,19 +833,21 @@ namespace TerrainSystemLogic {
             minY = std::min(minY, -96);
             int maxY = computeExpanseMaxY(baseSystem, worldCtx, cfg);
             const int totalColumns = size * size;
+            const bool terrainDetailPass = !runPostFeatures && startColumn >= totalColumns;
+            const bool terrainFillPass = !runPostFeatures && !terrainDetailPass;
+            const int logicalStartColumn = terrainDetailPass ? (startColumn - totalColumns) : startColumn;
             if (sectionMaxY < minY || sectionMinY > maxY) {
-                outNextColumn = totalColumns;
+                outNextColumn = runPostFeatures ? totalColumns : (totalColumns * 2);
                 outCompleted = true;
                 outPostFeaturesCompleted = true;
                 return true;
             }
 
-            int clampedStartColumn = std::max(0, std::min(startColumn, totalColumns));
+            int clampedStartColumn = std::max(0, std::min(logicalStartColumn, totalColumns));
             int clampedEndColumn = totalColumns;
             if (maxColumns > 0) {
                 clampedEndColumn = std::min(totalColumns, clampedStartColumn + maxColumns);
             }
-            const bool baseColumnsWereComplete = (clampedStartColumn >= totalColumns);
             bool wroteAny = false;
             std::vector<glm::ivec3> pendingChalkPlacements;
             pendingChalkPlacements.reserve(static_cast<size_t>(totalColumns));
@@ -1209,7 +1211,7 @@ namespace TerrainSystemLogic {
                     const bool waterFeatureColumnForPortal = isLand && waterFeatureColumn && (waterFeatureWaterY > surfaceY);
                     const bool portalColumnExpanse = isExpanseLevel && (!isLand || waterFeatureColumnForPortal);
                     int oreVariant = -1;
-                    if (oreEnabled && isLand && !isBeach) {
+                    if (terrainDetailPass && oreEnabled && isLand && !isBeach) {
                         oreVariant = oreVariantForColumn(worldXi, worldZi);
                     }
                     const int depthLavaBandTop = std::max(depthLavaTopY, depthLavaBottomY);
@@ -1247,15 +1249,18 @@ namespace TerrainSystemLogic {
                             depthLavaColumnTopY = std::max(depthLavaColumnTopY, depthLavaBandTop);
                         }
                     }
-                    const bool chalkColumnCandidate = chalkEnabled
+                    const bool chalkColumnCandidate = terrainDetailPass
+                        && chalkEnabled
                         && (chalkProto != nullptr)
                         && isLand
                         && chalkVeinForColumn(worldXi, worldZi);
-                    const bool clayColumnCandidate = clayEnabled
+                    const bool clayColumnCandidate = terrainDetailPass
+                        && clayEnabled
                         && (clayProto != nullptr)
                         && isLand
                         && clayVeinForColumn(worldXi, worldZi);
-                    const bool graniteColumnCandidate = graniteEnabled
+                    const bool graniteColumnCandidate = terrainDetailPass
+                        && graniteEnabled
                         && (graniteProto != nullptr)
                         && isLand
                         && (biomeID != 2)
@@ -1280,6 +1285,32 @@ namespace TerrainSystemLogic {
                         const float clayRoll = static_cast<float>((claySeedValue >> 8u) & 0xffu) / 255.0f;
                         clayReplaceRollPass = clayRoll <= clayReplaceChance;
                     }
+                    auto isDepthLavaTileId = [&](uint32_t id) {
+                        if (id == 0u) return false;
+                        for (const Entity* proto : depthLavaTileProtos) {
+                            if (proto && proto->prototypeID > 0 && id == static_cast<uint32_t>(proto->prototypeID)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+                    auto isOpenOrWaterNeighbor = [&](const glm::ivec3& cell) {
+                        static const std::array<glm::ivec3, 6> offsets = {{
+                            glm::ivec3(1, 0, 0),
+                            glm::ivec3(-1, 0, 0),
+                            glm::ivec3(0, 1, 0),
+                            glm::ivec3(0, -1, 0),
+                            glm::ivec3(0, 0, 1),
+                            glm::ivec3(0, 0, -1)
+                        }};
+                        for (const glm::ivec3& offset : offsets) {
+                            const uint32_t neighborId = voxelWorld.getBlockWorld(cell + offset);
+                            if (neighborId == 0u || neighborId == static_cast<uint32_t>(waterProto->prototypeID)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
                     for (int y = 0; y < size; ++y) {
                         int worldY = (sectionCoord.y * size + y) * scale;
                         glm::ivec3 worldCoord(sectionCoord.x * size + x,
@@ -1293,6 +1324,165 @@ namespace TerrainSystemLogic {
                         auto rangeOverlaps = [&](int minY, int maxY) {
                             return cellMaxY >= minY && cellMinY <= maxY;
                         };
+
+                        if (terrainDetailPass) {
+                            const uint32_t currentId = voxelWorld.getBlockWorld(worldCoord);
+                            if (currentId == 0u) continue;
+
+                            if (isExpanseLevel && worldY < expanseDepthSplitY) {
+                                if (!unifiedDepthsEnabled || worldY < unifiedDepthsMinY) {
+                                    continue;
+                                }
+                                if (currentId == static_cast<uint32_t>(waterProto->prototypeID)
+                                    || isDepthLavaTileId(currentId)) {
+                                    continue;
+                                }
+                                const uint32_t baseDepthStoneId = static_cast<uint32_t>(
+                                    (depthStoneProto ? depthStoneProto : stoneProto)->prototypeID
+                                );
+                                if (currentId != baseDepthStoneId
+                                    && currentId != static_cast<uint32_t>(stoneProto->prototypeID)) {
+                                    continue;
+                                }
+
+                                const int depthLodestoneVariant = depthLodestoneVariantAt(worldXi, worldY, worldZi);
+                                const bool depthCopperColumn = depthCopperVeinAt(worldXi, worldY, worldZi);
+                                uint32_t placeId = currentId;
+                                uint32_t placeColor = packColor(stoneColor);
+                                if (depthLodestoneVariant >= 0
+                                    && depthLodestoneVariant < static_cast<int>(depthLodestoneOreProtos.size())
+                                    && depthLodestoneOreProtos[static_cast<size_t>(depthLodestoneVariant)] != nullptr) {
+                                    const uint32_t oreCellSeed = hash3DInt(
+                                        worldXi + depthLodestoneSeed * 97,
+                                        worldY + depthLodestoneSeed * 131,
+                                        worldZi - depthLodestoneSeed * 151
+                                    );
+                                    const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
+                                    if (oreCellRoll <= depthLodestoneReplaceChance) {
+                                        placeId = static_cast<uint32_t>(
+                                            depthLodestoneOreProtos[static_cast<size_t>(depthLodestoneVariant)]->prototypeID
+                                        );
+                                        placeColor = packColor(glm::vec3(0.33f, 0.35f, 0.36f));
+                                    }
+                                } else if (depthCopperColumn && depthCopperSulfateOreProto) {
+                                    const uint32_t oreCellSeed = hash3DInt(
+                                        worldXi + depthCopperSeed * 97,
+                                        worldY + depthCopperSeed * 131,
+                                        worldZi - depthCopperSeed * 151
+                                    );
+                                    const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
+                                    if (oreCellRoll <= depthCopperReplaceChance) {
+                                        placeId = static_cast<uint32_t>(depthCopperSulfateOreProto->prototypeID);
+                                        placeColor = packColor(glm::vec3(0.15f, 0.62f, 0.86f));
+                                    }
+                                }
+                                if (placeId != currentId) {
+                                    voxelWorld.setBlock(worldCoord, placeId, placeColor, false);
+                                    wroteAny = true;
+                                }
+                                continue;
+                            }
+
+                            if (!isLand) continue;
+
+                            if (rangeContains(surfaceY)) {
+                                if (waterFeatureColumn
+                                    && waterFeatureWaterY > surfaceY
+                                    && riverColumn
+                                    && clayColumnCandidate
+                                    && clayReplaceRollPass
+                                    && clayProto
+                                    && currentId == static_cast<uint32_t>(soilProto->prototypeID)) {
+                                    voxelWorld.setBlock(
+                                        worldCoord,
+                                        static_cast<uint32_t>(clayProto->prototypeID),
+                                        packColor(clayColor),
+                                        false
+                                    );
+                                    wroteAny = true;
+                                } else if (chalkColumnCandidate && chalkReplaceRollPass && chalkProto) {
+                                    pendingChalkPlacements.emplace_back(
+                                        sectionCoord.x * size + x,
+                                        surfaceY,
+                                        sectionCoord.z * size + z
+                                    );
+                                }
+                                continue;
+                            }
+
+                            if (worldY < surfaceY) {
+                                const int soilMin = surfaceY - cfg.soilDepth;
+                                const int stoneMin = surfaceY - cfg.soilDepth - cfg.stoneDepth;
+                                const bool inSoilLayer = rangeOverlaps(soilMin, surfaceY - 1);
+                                const bool inStoneLayer = rangeOverlaps(cfg.minY, stoneMin) || (worldY < stoneMin);
+                                if (!(inSoilLayer || inStoneLayer)) continue;
+
+                                const uint32_t baseSoilId = static_cast<uint32_t>(soilProto->prototypeID);
+                                const uint32_t baseStoneId = static_cast<uint32_t>(stoneProto->prototypeID);
+                                if (currentId != baseSoilId && currentId != baseStoneId) continue;
+
+                                bool caveAdjacent = false;
+                                if (inIsland) {
+                                    caveAdjacent = isOpenOrWaterNeighbor(worldCoord);
+                                }
+
+                                bool placeOre = false;
+                                if (oreVariant >= 0
+                                    && oreVariant < static_cast<int>(oreProtos.size())
+                                    && oreProtos[static_cast<size_t>(oreVariant)] != nullptr) {
+                                    const int depthBelowSurface = surfaceY - worldY;
+                                    float oreChance = inStoneLayer ? oreStoneReplaceChance : oreSoilReplaceChance;
+                                    if (caveAdjacent) {
+                                        oreChance = std::min(1.0f, oreChance + oreCaveAdjacencyBoost);
+                                    }
+                                    if (depthBelowSurface >= oreMinDepthFromSurface) {
+                                        const uint32_t oreCellSeed = hash3DInt(
+                                            worldXi + oreSeed * 97,
+                                            worldY + oreSeed * 131,
+                                            worldZi - oreSeed * 151
+                                        );
+                                        const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
+                                        placeOre = (oreCellRoll <= oreChance);
+                                    }
+                                }
+
+                                bool placeGranite = false;
+                                if (!placeOre
+                                    && inStoneLayer
+                                    && caveAdjacent
+                                    && (worldY <= waterSurfaceY)
+                                    && graniteColumnCandidate
+                                    && graniteProto) {
+                                    const uint32_t graniteSeedValue = hash3DInt(
+                                        worldXi + graniteSeed * 103,
+                                        worldY + graniteSeed * 127,
+                                        worldZi - graniteSeed * 149
+                                    );
+                                    const float graniteRoll = static_cast<float>((graniteSeedValue >> 8u) & 0xffu) / 255.0f;
+                                    placeGranite = graniteRoll <= graniteReplaceChance;
+                                }
+
+                                if (placeOre) {
+                                    voxelWorld.setBlock(
+                                        worldCoord,
+                                        oreProtos[static_cast<size_t>(oreVariant)]->prototypeID,
+                                        oreColors[static_cast<size_t>(oreVariant)],
+                                        false
+                                    );
+                                    wroteAny = true;
+                                } else if (placeGranite
+                                           && currentId != static_cast<uint32_t>(graniteProto->prototypeID)) {
+                                    voxelWorld.setBlock(
+                                        worldCoord,
+                                        graniteProto->prototypeID,
+                                        packColor(graniteColor),
+                                        false
+                                    );
+                                    wroteAny = true;
+                                }
+                            }
+                            continue;
+                        }
 
                         bool carve = false;
                         if (inIsland && worldY <= (isLand ? surfaceY : waterFloorY)) {
@@ -1389,36 +1579,12 @@ namespace TerrainSystemLogic {
                                     }
                                     continue;
                                 }
-                                const int depthLodestoneVariant = depthLodestoneVariantAt(worldXi, worldY, worldZi);
-                                const bool depthCopperColumn = depthCopperVeinAt(worldXi, worldY, worldZi);
-                                uint32_t placeId = static_cast<uint32_t>((depthStoneProto ? depthStoneProto : stoneProto)->prototypeID);
-                                uint32_t placeColor = packColor(stoneColor);
-                                if (depthLodestoneVariant >= 0
-                                    && depthLodestoneVariant < static_cast<int>(depthLodestoneOreProtos.size())
-                                    && depthLodestoneOreProtos[static_cast<size_t>(depthLodestoneVariant)] != nullptr) {
-                                    const uint32_t oreCellSeed = hash3DInt(
-                                        worldXi + depthLodestoneSeed * 97,
-                                        worldY + depthLodestoneSeed * 131,
-                                        worldZi - depthLodestoneSeed * 151
-                                    );
-                                    const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
-                                    if (oreCellRoll <= depthLodestoneReplaceChance) {
-                                        placeId = static_cast<uint32_t>(depthLodestoneOreProtos[static_cast<size_t>(depthLodestoneVariant)]->prototypeID);
-                                        placeColor = packColor(glm::vec3(0.33f, 0.35f, 0.36f));
-                                    }
-                                } else if (depthCopperColumn && depthCopperSulfateOreProto) {
-                                    const uint32_t oreCellSeed = hash3DInt(
-                                        worldXi + depthCopperSeed * 97,
-                                        worldY + depthCopperSeed * 131,
-                                        worldZi - depthCopperSeed * 151
-                                    );
-                                    const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
-                                    if (oreCellRoll <= depthCopperReplaceChance) {
-                                        placeId = static_cast<uint32_t>(depthCopperSulfateOreProto->prototypeID);
-                                        placeColor = packColor(glm::vec3(0.15f, 0.62f, 0.86f));
-                                    }
-                                }
-                                voxelWorld.setBlock(worldCoord, placeId, placeColor, false);
+                                voxelWorld.setBlock(
+                                    worldCoord,
+                                    static_cast<uint32_t>((depthStoneProto ? depthStoneProto : stoneProto)->prototypeID),
+                                    packColor(stoneColor),
+                                    false
+                                );
                                 wroteAny = true;
                                 continue;
                             }
@@ -1483,28 +1649,13 @@ namespace TerrainSystemLogic {
 
                         if (rangeContains(surfaceY)) {
                             if (waterFeatureColumn && waterFeatureWaterY > surfaceY) {
-                                const bool placeClayRiverBed = riverColumn
-                                    && clayColumnCandidate
-                                    && clayReplaceRollPass
-                                    && clayProto;
                                 voxelWorld.setBlock(worldCoord,
-                                    placeClayRiverBed
-                                        ? static_cast<uint32_t>(clayProto->prototypeID)
-                                        : static_cast<uint32_t>(soilProto->prototypeID),
-                                    placeClayRiverBed
-                                        ? packColor(clayColor)
-                                        : packColor(soilColor),
+                                    static_cast<uint32_t>(soilProto->prototypeID),
+                                    packColor(soilColor),
                                     false
                                 );
                                 wroteAny = true;
                                 continue;
-                            }
-                            if (chalkColumnCandidate && chalkReplaceRollPass && chalkProto) {
-                                pendingChalkPlacements.emplace_back(
-                                    sectionCoord.x * size + x,
-                                    surfaceY,
-                                    sectionCoord.z * size + z
-                                );
                             }
 
                             glm::vec3 topColor = isBeach ? sandColor : biomeSurfaceColor;
@@ -1528,67 +1679,10 @@ namespace TerrainSystemLogic {
                             bool inSoilLayer = rangeOverlaps(soilMin, surfaceY - 1);
                             bool inStoneLayer = rangeOverlaps(cfg.minY, stoneMin) || (worldY < stoneMin);
                             if (inSoilLayer || inStoneLayer) {
-                                bool caveAdjacent = false;
-                                if (inIsland) {
-                                    caveAdjacent =
-                                        caveCarvedAt(worldX + 1.0f, static_cast<float>(worldY), worldZ, surfaceY, true) ||
-                                        caveCarvedAt(worldX - 1.0f, static_cast<float>(worldY), worldZ, surfaceY, true) ||
-                                        caveCarvedAt(worldX, static_cast<float>(worldY), worldZ + 1.0f, surfaceY, true) ||
-                                        caveCarvedAt(worldX, static_cast<float>(worldY), worldZ - 1.0f, surfaceY, true) ||
-                                        caveCarvedAt(worldX, static_cast<float>(worldY) + 1.0f, worldZ, surfaceY, true) ||
-                                        caveCarvedAt(worldX, static_cast<float>(worldY) - 1.0f, worldZ, surfaceY, true);
-                                }
-                                bool placeOre = false;
-                                if (oreVariant >= 0
-                                    && oreVariant < static_cast<int>(oreProtos.size())
-                                    && oreProtos[static_cast<size_t>(oreVariant)] != nullptr) {
-                                    int depthBelowSurface = surfaceY - worldY;
-                                    float oreChance = inStoneLayer ? oreStoneReplaceChance : oreSoilReplaceChance;
-                                    if (caveAdjacent) {
-                                        oreChance = std::min(1.0f, oreChance + oreCaveAdjacencyBoost);
-                                    }
-                                    if (depthBelowSurface >= oreMinDepthFromSurface) {
-                                        const uint32_t oreCellSeed = hash3DInt(
-                                            worldXi + oreSeed * 97,
-                                            worldY + oreSeed * 131,
-                                            worldZi - oreSeed * 151
-                                        );
-                                        const float oreCellRoll = static_cast<float>((oreCellSeed >> 8u) & 0xffu) / 255.0f;
-                                        placeOre = (oreCellRoll <= oreChance);
-                                    }
-                                }
-                                bool placeGranite = false;
-                                if (!placeOre
-                                    && inStoneLayer
-                                    && caveAdjacent
-                                    && (worldY <= waterSurfaceY)
-                                    && graniteColumnCandidate
-                                    && graniteProto) {
-                                    const uint32_t graniteSeedValue = hash3DInt(
-                                        worldXi + graniteSeed * 103,
-                                        worldY + graniteSeed * 127,
-                                        worldZi - graniteSeed * 149
-                                    );
-                                    const float graniteRoll = static_cast<float>((graniteSeedValue >> 8u) & 0xffu) / 255.0f;
-                                    placeGranite = graniteRoll <= graniteReplaceChance;
-                                }
-                                if (placeOre) {
-                                    voxelWorld.setBlock(worldCoord,
-                                                           oreProtos[static_cast<size_t>(oreVariant)]->prototypeID,
-                                                           oreColors[static_cast<size_t>(oreVariant)],
-                                                           false);
-                                } else if (placeGranite) {
-                                    voxelWorld.setBlock(worldCoord,
-                                        graniteProto->prototypeID,
-                                        packColor(graniteColor),
-                                        false
-                                    );
+                                if (inSoilLayer) {
+                                    voxelWorld.setBlock(worldCoord, soilProto->prototypeID, packColor(soilColor), false);
                                 } else {
-                                    if (inSoilLayer) {
-                                        voxelWorld.setBlock(worldCoord, soilProto->prototypeID, packColor(soilColor), false);
-                                    } else {
-                                        voxelWorld.setBlock(worldCoord, stoneProto->prototypeID, packColor(stoneColor), false);
-                                    }
+                                    voxelWorld.setBlock(worldCoord, stoneProto->prototypeID, packColor(stoneColor), false);
                                 }
                                 wroteAny = true;
                                 continue;
@@ -1596,10 +1690,18 @@ namespace TerrainSystemLogic {
                         }
                     }
             }
-            outNextColumn = clampedEndColumn;
-            outCompleted = (clampedEndColumn >= totalColumns);
-            const bool baseColumnsNowComplete = (clampedEndColumn >= totalColumns);
-            const bool justCompletedBaseColumns = (!baseColumnsWereComplete && baseColumnsNowComplete);
+            if (runPostFeatures) {
+                outNextColumn = totalColumns;
+                outCompleted = true;
+            } else if (terrainFillPass) {
+                outNextColumn = (clampedEndColumn >= totalColumns) ? totalColumns : clampedEndColumn;
+                outCompleted = false;
+            } else {
+                outNextColumn = (clampedEndColumn >= totalColumns)
+                    ? (totalColumns * 2)
+                    : (totalColumns + clampedEndColumn);
+                outCompleted = (clampedEndColumn >= totalColumns);
+            }
             const VoxelSectionKey sectionKey{sectionCoord};
             auto cachedChalkIt = g_pendingDepthFeatureChalkPlacements.find(sectionKey);
             if (runPostFeatures) {
@@ -1705,8 +1807,8 @@ namespace TerrainSystemLogic {
 
             const bool hadAnyWrites = (inOutWroteAny || wroteAny);
             inOutWroteAny = hadAnyWrites;
-            // Publish once base generation completes, and on any later post-feature mutation.
-            const bool publishSectionNow = justCompletedBaseColumns ? hadAnyWrites : wroteAny;
+            // Keep terrain writes hidden from meshing until the terrain phases are fully done.
+            const bool publishSectionNow = runPostFeatures ? wroteAny : (outCompleted && hadAnyWrites);
             if (publishSectionNow) {
                 auto markSectionDirty = [&](const glm::ivec3& coord, bool bumpVersion) {
                     VoxelSectionKey dirtyKey{coord};

@@ -185,6 +185,11 @@ namespace WorldRenderSystemLogic {
         const bool wallStoneUvJitterEnabled = RenderInitSystemLogic::getRegistryBool(baseSystem, "WallStoneUvJitterEnabled", true);
         const bool voxelGridLinesEnabled = RenderInitSystemLogic::getRegistryBool(baseSystem, "VoxelGridLinesEnabled", true);
         const bool voxelGridLineInvertColorEnabled = RenderInitSystemLogic::getRegistryBool(baseSystem, "VoxelGridLineInvertColorEnabled", false);
+        const bool sceneTriangleWireframeDebugEnabled = RenderInitSystemLogic::getRegistryBool(
+            baseSystem,
+            "SceneTriangleWireframeDebugEnabled",
+            false
+        );
         const float wallStoneUvJitterMinPixels = glm::clamp(
             getRegistryFloat(baseSystem, "WallStoneUvJitterMinPixels", 1.0f),
             0.0f,
@@ -208,39 +213,60 @@ namespace WorldRenderSystemLogic {
 
         struct VisibleVoxelRenderSection {
             const ChunkRenderBuffers* buffers = nullptr;
+            glm::vec3 minBounds = glm::vec3(0.0f);
+            glm::vec3 maxBounds = glm::vec3(0.0f);
             float dist2 = 0.0f;
         };
         std::vector<VisibleVoxelRenderSection> visibleVoxelRenderSections;
+        std::vector<VisibleVoxelRenderSection> visibleFarRenderSections;
         const int voxelRenderMaxVisibleSections = std::max(
             0,
             RenderInitSystemLogic::getRegistryInt(baseSystem, "voxelRenderMaxVisibleSections", 512)
         );
+        const int voxelSectionSizeBlocks = baseSystem.voxelWorld
+            ? std::max(1, baseSystem.voxelWorld->sectionSize)
+            : 16;
+        const int voxelClusterSizeBlocks = std::max(
+            4,
+            voxelSectionSizeBlocks / 2
+        );
+        const int voxelClustersPerAxis = std::max(
+            1,
+            (voxelSectionSizeBlocks + voxelClusterSizeBlocks - 1) / voxelClusterSizeBlocks
+        );
+        const int voxelClustersPerSection = voxelClustersPerAxis * voxelClustersPerAxis * voxelClustersPerAxis;
+        const int voxelRenderMaxVisibleClusters =
+            (voxelRenderMaxVisibleSections > 0)
+                ? voxelRenderMaxVisibleSections * voxelClustersPerSection
+                : 0;
         auto collectVisibleVoxelRenderSections = [&](const glm::vec3& cameraPos,
                                                      std::vector<VisibleVoxelRenderSection>& outSections) {
             outSections.clear();
             if (!useVoxelRendering || !baseSystem.voxelWorld || !baseSystem.voxelRender) return;
             VoxelWorldContext& voxelWorld = *baseSystem.voxelWorld;
             VoxelRenderContext& voxelRender = *baseSystem.voxelRender;
-            outSections.reserve(voxelRender.renderBuffers.size());
-            for (const auto& [sectionKey, buffers] : voxelRender.renderBuffers) {
+            size_t clusterCapacity = 0;
+            for (const auto& [_, clusters] : voxelRender.renderClusters) clusterCapacity += clusters.size();
+            outSections.reserve(clusterCapacity);
+            for (const auto& [sectionKey, clusters] : voxelRender.renderClusters) {
                 auto secIt = voxelWorld.sections.find(sectionKey);
                 if (secIt == voxelWorld.sections.end()) continue;
-                const VoxelSection& section = secIt->second;
-                if (!mapViewActive
-                    && !RenderInitSystemLogic::shouldRenderVoxelSection(baseSystem, section, cameraPos)) {
-                    continue;
+                for (const VoxelRenderCluster& cluster : clusters) {
+                    if (!mapViewActive
+                        && !FrustumCullingSystemLogic::ShouldRenderWorldAabb(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                        continue;
+                    }
+                    if (!mapViewActive
+                        && OcclusionCullingSystemLogic::IsWorldAabbOccluded(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                        continue;
+                    }
+                    const glm::vec3 center = 0.5f * (cluster.minBounds + cluster.maxBounds);
+                    const glm::vec3 delta = center - cameraPos;
+                    outSections.push_back({&cluster.buffers, cluster.minBounds, cluster.maxBounds, glm::dot(delta, delta)});
                 }
-                const float span = static_cast<float>(section.size);
-                const glm::vec3 center(
-                    (static_cast<float>(section.coord.x) + 0.5f) * span,
-                    (static_cast<float>(section.coord.y) + 0.5f) * span,
-                    (static_cast<float>(section.coord.z) + 0.5f) * span
-                );
-                const glm::vec3 delta = center - cameraPos;
-                outSections.push_back({&buffers, glm::dot(delta, delta)});
             }
-            if (voxelRenderMaxVisibleSections > 0
-                && static_cast<int>(outSections.size()) > voxelRenderMaxVisibleSections) {
+            if (voxelRenderMaxVisibleClusters > 0
+                && static_cast<int>(outSections.size()) > voxelRenderMaxVisibleClusters) {
                 std::sort(
                     outSections.begin(),
                     outSections.end(),
@@ -248,8 +274,30 @@ namespace WorldRenderSystemLogic {
                         return a.dist2 < b.dist2;
                     }
                 );
-                outSections.resize(static_cast<size_t>(voxelRenderMaxVisibleSections));
+                outSections.resize(static_cast<size_t>(voxelRenderMaxVisibleClusters));
             }
+        };
+        auto collectVisibleFarRenderSections = [&](const glm::vec3& cameraPos,
+                                                   std::vector<VisibleVoxelRenderSection>& outSections) {
+            outSections.clear();
+            if (!baseSystem.farTerrain || !baseSystem.farTerrain->enabled) return;
+            auto appendVisibleClusters = [&](const std::vector<VoxelRenderCluster>& clusters) {
+                for (const VoxelRenderCluster& cluster : clusters) {
+                    if (!mapViewActive
+                        && !FrustumCullingSystemLogic::ShouldRenderWorldAabb(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                        continue;
+                    }
+                    if (!mapViewActive
+                        && OcclusionCullingSystemLogic::IsWorldAabbOccluded(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                        continue;
+                    }
+                    const glm::vec3 center = 0.5f * (cluster.minBounds + cluster.maxBounds);
+                    const glm::vec3 delta = center - cameraPos;
+                    outSections.push_back({&cluster.buffers, cluster.minBounds, cluster.maxBounds, glm::dot(delta, delta)});
+                }
+            };
+            appendVisibleClusters(baseSystem.farTerrain->bodyRenderClusters);
+            appendVisibleClusters(baseSystem.farTerrain->handoffRenderClusters);
         };
 
 
@@ -364,7 +412,7 @@ namespace WorldRenderSystemLogic {
         }
         glm::vec3 skyTop(0.52f, 0.66f, 0.95f);
         glm::vec3 skyBottom(0.03f, 0.06f, 0.18f);
-        SkyboxSystemLogic::getCurrentSkyColors(dayFraction, world.skyKeys, skyTop, skyBottom);
+        SkyboxSystemLogic::getCurrentSkyColors(baseSystem, dayFraction, world.skyKeys, skyTop, skyBottom);
         if (renderToWaterSceneTarget) {
             renderBackend.beginOffscreenColorPass(
                 renderer.waterSceneFBO,
@@ -401,6 +449,7 @@ namespace WorldRenderSystemLogic {
         renderer.blockShader->setVec3("lightDir",lightDir);
         renderer.blockShader->setVec3("ambientLight", ambientLightColor);
         renderer.blockShader->setVec3("diffuseLight", diffuseLightColor);
+        renderer.blockShader->setInt("wireframeDebug", 0);
         renderer.blockShader->setInt("voxelGridLinesEnabled", voxelGridLinesEnabled ? 1 : 0);
         renderer.blockShader->setInt("voxelGridLineInvertColorEnabled", voxelGridLineInvertColorEnabled ? 1 : 0);
         renderer.blockShader->setMat4("model", glm::mat4(1.0f));
@@ -410,6 +459,9 @@ namespace WorldRenderSystemLogic {
 
         if (useVoxelRendering) {
             collectVisibleVoxelRenderSections(playerPos, visibleVoxelRenderSections);
+        }
+        if (baseSystem.farTerrain && baseSystem.farTerrain->enabled) {
+            collectVisibleFarRenderSections(playerPos, visibleFarRenderSections);
         }
 
         for (int i = 0; i < static_cast<int>(RenderBehavior::COUNT); ++i) {
@@ -620,6 +672,7 @@ namespace WorldRenderSystemLogic {
             renderer.faceShader->setInt("foliageWindEnabled", foliageWindAnimationEnabled ? 1 : 0);
             renderer.faceShader->setInt("waterCascadeBrightnessEnabled", waterCascadeBrightnessEnabled ? 1 : 0);
             renderer.faceShader->setInt("maskedFoliagePassMode", 0);
+            renderer.faceShader->setInt("wireframeDebug", 0);
             renderer.faceShader->setFloat("waterCascadeBrightnessStrength", waterCascadeBrightnessStrength);
             renderer.faceShader->setFloat("waterCascadeBrightnessSpeed", waterCascadeBrightnessSpeed);
             renderer.faceShader->setFloat("waterCascadeBrightnessScale", waterCascadeBrightnessScale);
@@ -839,6 +892,12 @@ namespace WorldRenderSystemLogic {
                     if (!section.buffers->usesTexturedFaceBuffers) continue;
                     renderer.faceShader->setInt("sectionTier", 0);
                     for (int faceType = 0; faceType < 6; ++faceType) {
+                        int clippedCount = section.buffers->faceBuffers.clippedOpaqueCounts[faceType];
+                        if (clippedCount > 0 && section.buffers->faceBuffers.clippedOpaqueVaos[faceType] != 0) {
+                            renderer.faceShader->setInt("faceType", faceType);
+                            renderBackend.bindVertexArray(section.buffers->faceBuffers.clippedOpaqueVaos[faceType]);
+                            renderBackend.drawArraysTrianglesInstanced(0, 3, clippedCount);
+                        }
                         int count = section.buffers->faceBuffers.opaqueCounts[faceType];
                         if (count > 0 && section.buffers->faceBuffers.opaqueVaos[faceType] != 0) {
                             renderer.faceShader->setInt("faceType", faceType);
@@ -878,7 +937,7 @@ namespace WorldRenderSystemLogic {
             setCullEnabled(false);
         }
 
-        if (renderer.faceShader && renderer.faceVAO) {
+        if (!sceneTriangleWireframeDebugEnabled && renderer.faceShader && renderer.faceVAO) {
             std::array<std::vector<FaceInstanceRenderData>, 6> faceInstancesOpaque;
             std::array<std::vector<FaceInstanceRenderData>, 6> faceInstancesAlpha;
             std::array<std::vector<FaceInstanceRenderData>, 6> faceInstancesAlphaWaterLike;
@@ -904,7 +963,13 @@ namespace WorldRenderSystemLogic {
             drawFaceBatches(faceInstancesAlphaWaterLike, false);
         }
 
-        if (useVoxelRendering && renderer.faceShader && renderer.faceVAO) {
+        const bool farTerrainRenderable = baseSystem.farTerrain
+            && baseSystem.farTerrain->enabled
+            && !visibleFarRenderSections.empty();
+        if (!sceneTriangleWireframeDebugEnabled
+            && (useVoxelRendering || farTerrainRenderable)
+            && renderer.faceShader
+            && renderer.faceVAO) {
             setBlendEnabled(true);
             setBlendModeAlpha();
             renderer.faceShader->use();
@@ -922,6 +987,7 @@ namespace WorldRenderSystemLogic {
             renderer.faceShader->setInt("foliageWindEnabled", foliageWindAnimationEnabled ? 1 : 0);
             renderer.faceShader->setInt("waterCascadeBrightnessEnabled", waterCascadeBrightnessEnabled ? 1 : 0);
             renderer.faceShader->setInt("maskedFoliagePassMode", 1);
+                renderer.faceShader->setInt("wireframeDebug", 0);
             renderer.faceShader->setFloat("waterCascadeBrightnessStrength", waterCascadeBrightnessStrength);
             renderer.faceShader->setFloat("waterCascadeBrightnessSpeed", waterCascadeBrightnessSpeed);
             renderer.faceShader->setFloat("waterCascadeBrightnessScale", waterCascadeBrightnessScale);
@@ -933,10 +999,38 @@ namespace WorldRenderSystemLogic {
             } else {
                 setCullBackFaceCCWEnabled(true);
             }
+            if (farTerrainRenderable) {
+                renderer.faceShader->setInt("sectionTier", 1);
+                const auto drawFarBuffers = [&](const ChunkRenderBuffers& farBuffers) {
+                    for (int faceType = 0; faceType < 6; ++faceType) {
+                        int clippedCount = farBuffers.faceBuffers.clippedOpaqueCounts[faceType];
+                        if (clippedCount > 0 && farBuffers.faceBuffers.clippedOpaqueVaos[faceType] != 0) {
+                            renderer.faceShader->setInt("faceType", faceType);
+                            renderBackend.bindVertexArray(farBuffers.faceBuffers.clippedOpaqueVaos[faceType]);
+                            renderBackend.drawArraysTrianglesInstanced(0, 3, clippedCount);
+                        }
+                        int count = farBuffers.faceBuffers.opaqueCounts[faceType];
+                        if (count > 0 && farBuffers.faceBuffers.opaqueVaos[faceType] != 0) {
+                            renderer.faceShader->setInt("faceType", faceType);
+                            renderBackend.bindVertexArray(farBuffers.faceBuffers.opaqueVaos[faceType]);
+                            renderBackend.drawArraysTrianglesInstanced(0, 6, count);
+                        }
+                    }
+                };
+                for (const auto& cluster : visibleFarRenderSections) {
+                    drawFarBuffers(*cluster.buffers);
+                }
+            }
             for (const auto& section : visibleVoxelRenderSections) {
                 if (!section.buffers->usesTexturedFaceBuffers) continue;
                 renderer.faceShader->setInt("sectionTier", 0);
                 for (int faceType = 0; faceType < 6; ++faceType) {
+                    int clippedCount = section.buffers->faceBuffers.clippedOpaqueCounts[faceType];
+                    if (clippedCount > 0 && section.buffers->faceBuffers.clippedOpaqueVaos[faceType] != 0) {
+                        renderer.faceShader->setInt("faceType", faceType);
+                        renderBackend.bindVertexArray(section.buffers->faceBuffers.clippedOpaqueVaos[faceType]);
+                        renderBackend.drawArraysTrianglesInstanced(0, 3, clippedCount);
+                    }
                     int count = section.buffers->faceBuffers.opaqueCounts[faceType];
                     if (count > 0 && section.buffers->faceBuffers.opaqueVaos[faceType] != 0) {
                         renderer.faceShader->setInt("faceType", faceType);
@@ -1102,6 +1196,15 @@ namespace WorldRenderSystemLogic {
 
             setCullEnabled(false);
             renderer.faceShader->setMat4("model", glm::mat4(1.0f));
+        }
+
+        if (renderer.faceShader) {
+            renderer.faceShader->use();
+            renderer.faceShader->setInt("wireframeDebug", 0);
+        }
+        if (renderer.blockShader) {
+            renderer.blockShader->use();
+            renderer.blockShader->setInt("wireframeDebug", 0);
         }
 
         WorldRenderViewState heldItemFrame;

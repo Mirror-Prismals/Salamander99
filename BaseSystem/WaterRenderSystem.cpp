@@ -1,6 +1,8 @@
 namespace {
     struct VisibleWaterSection {
         const ChunkRenderBuffers* buffers = nullptr;
+        glm::vec3 minBounds = glm::vec3(0.0f);
+        glm::vec3 maxBounds = glm::vec3(0.0f);
         float dist2 = 0.0f;
     };
 
@@ -19,23 +21,24 @@ namespace {
         if (!baseSystem.voxelWorld || !baseSystem.voxelRender) return;
         const VoxelWorldContext& voxelWorld = *baseSystem.voxelWorld;
         const VoxelRenderContext& voxelRender = *baseSystem.voxelRender;
-        outSections.reserve(voxelRender.renderBuffers.size());
-        for (const auto& [sectionKey, buffers] : voxelRender.renderBuffers) {
-            if (!chunkHasWaterBuffers(buffers)) continue;
+        size_t clusterCapacity = 0;
+        for (const auto& [_, clusters] : voxelRender.renderClusters) clusterCapacity += clusters.size();
+        outSections.reserve(clusterCapacity);
+        for (const auto& [sectionKey, clusters] : voxelRender.renderClusters) {
             auto secIt = voxelWorld.sections.find(sectionKey);
             if (secIt == voxelWorld.sections.end()) continue;
-            const VoxelSection& section = secIt->second;
-            if (!RenderInitSystemLogic::shouldRenderVoxelSection(baseSystem, section, cameraPos)) {
-                continue;
+            for (const VoxelRenderCluster& cluster : clusters) {
+                if (!chunkHasWaterBuffers(cluster.buffers)) continue;
+                if (!FrustumCullingSystemLogic::ShouldRenderWorldAabb(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                    continue;
+                }
+                if (OcclusionCullingSystemLogic::IsWorldAabbOccluded(baseSystem, cluster.minBounds, cluster.maxBounds)) {
+                    continue;
+                }
+                const glm::vec3 center = 0.5f * (cluster.minBounds + cluster.maxBounds);
+                const glm::vec3 delta = center - cameraPos;
+                outSections.push_back({&cluster.buffers, cluster.minBounds, cluster.maxBounds, glm::dot(delta, delta)});
             }
-            const float span = static_cast<float>(section.size);
-            const glm::vec3 center(
-                (static_cast<float>(section.coord.x) + 0.5f) * span,
-                (static_cast<float>(section.coord.y) + 0.5f) * span,
-                (static_cast<float>(section.coord.z) + 0.5f) * span
-            );
-            const glm::vec3 delta = center - cameraPos;
-            outSections.push_back({&buffers, glm::dot(delta, delta)});
         }
     }
 
@@ -113,7 +116,7 @@ namespace WaterRenderSystemLogic {
         float dayFraction = static_cast<float>(daySeconds / 86400.0);
         glm::vec3 skyTop(0.52f, 0.66f, 0.95f);
         glm::vec3 skyBottom(0.03f, 0.06f, 0.18f);
-        SkyboxSystemLogic::getCurrentSkyColors(dayFraction, world.skyKeys, skyTop, skyBottom);
+        SkyboxSystemLogic::getCurrentSkyColors(baseSystem, dayFraction, world.skyKeys, skyTop, skyBottom);
 
         const float hour = dayFraction * 24.0f;
         const float sunU = (hour - 6.0f) / 12.0f;

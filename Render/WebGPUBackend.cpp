@@ -359,6 +359,12 @@ namespace {
         std::string message;
     };
 
+    struct BufferMapResult {
+        bool done = false;
+        WGPUMapAsyncStatus status = WGPUMapAsyncStatus_Error;
+        std::string message;
+    };
+
 
     void onRequestAdapter(WGPURequestAdapterStatus status,
                           WGPUAdapter adapter,
@@ -384,6 +390,18 @@ namespace {
         DeviceRequestResult& result = *static_cast<DeviceRequestResult*>(userdata1);
         result.status = status;
         result.device = device;
+        result.message = fromStringView(message);
+        result.done = true;
+    }
+
+    void onBufferMap(WGPUMapAsyncStatus status,
+                     WGPUStringView message,
+                     void* userdata1,
+                     void* userdata2) {
+        (void)userdata2;
+        if (!userdata1) return;
+        BufferMapResult& result = *static_cast<BufferMapResult*>(userdata1);
+        result.status = status;
         result.message = fromStringView(message);
         result.done = true;
     }
@@ -3755,11 +3773,102 @@ bool WebGPUBackend::readTexture2DRgba(RenderHandle texture,
                                       int width,
                                       int height,
                                       std::vector<unsigned char>& outPixels) const {
-    (void)texture;
-    (void)width;
-    (void)height;
     outPixels.clear();
+    if (width <= 0 || height <= 0 || !state || !texture) return false;
+#if SALAMANDER_WEBGPU_NATIVE
+    if (!state->device || !state->queue || !state->instance) return false;
+    const auto texIt = state->textures.find(texture);
+    if (texIt == state->textures.end() || !texIt->second.texture) return false;
+    if (texIt->second.width != static_cast<uint32_t>(width)
+        || texIt->second.height != static_cast<uint32_t>(height)) {
+        return false;
+    }
+
+    const uint64_t bytesPerRow = static_cast<uint64_t>(width) * 4u;
+    const uint64_t alignedBytesPerRow = ((bytesPerRow + 255u) / 256u) * 256u;
+    const uint64_t bufferSize = alignedBytesPerRow * static_cast<uint64_t>(height);
+
+    WGPUBufferDescriptor bufferDesc{};
+    bufferDesc.label = stringView("Cardinal Texture Readback");
+    bufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    bufferDesc.size = bufferSize;
+    bufferDesc.mappedAtCreation = false;
+    WGPUBuffer readbackBuffer = wgpuDeviceCreateBuffer(state->device, &bufferDesc);
+    if (!readbackBuffer) return false;
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(state->device, nullptr);
+    if (!encoder) {
+        wgpuBufferRelease(readbackBuffer);
+        return false;
+    }
+
+    WGPUTexelCopyTextureInfo source{};
+    source.texture = texIt->second.texture;
+    source.mipLevel = 0;
+    source.origin = {0, 0, 0};
+    source.aspect = WGPUTextureAspect_All;
+
+    WGPUTexelCopyBufferInfo destination{};
+    destination.buffer = readbackBuffer;
+    destination.layout.offset = 0;
+    destination.layout.bytesPerRow = static_cast<uint32_t>(alignedBytesPerRow);
+    destination.layout.rowsPerImage = static_cast<uint32_t>(height);
+
+    WGPUExtent3D copySize{};
+    copySize.width = static_cast<uint32_t>(width);
+    copySize.height = static_cast<uint32_t>(height);
+    copySize.depthOrArrayLayers = 1;
+    wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &copySize);
+
+    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, nullptr);
+    wgpuCommandEncoderRelease(encoder);
+    if (!commandBuffer) {
+        wgpuBufferRelease(readbackBuffer);
+        return false;
+    }
+    wgpuQueueSubmit(state->queue, 1, &commandBuffer);
+    wgpuCommandBufferRelease(commandBuffer);
+
+    BufferMapResult result{};
+    WGPUBufferMapCallbackInfo callbackInfo{};
+    callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
+    callbackInfo.callback = onBufferMap;
+    callbackInfo.userdata1 = &result;
+    wgpuBufferMapAsync(readbackBuffer, WGPUMapMode_Read, 0, bufferSize, callbackInfo);
+    if (!pumpInstanceUntil(state->instance, result.done, std::chrono::seconds(4))) {
+        wgpuBufferDestroy(readbackBuffer);
+        wgpuBufferRelease(readbackBuffer);
+        return false;
+    }
+    if (result.status != WGPUMapAsyncStatus_Success) {
+        wgpuBufferDestroy(readbackBuffer);
+        wgpuBufferRelease(readbackBuffer);
+        return false;
+    }
+
+    const void* mapped = wgpuBufferGetConstMappedRange(readbackBuffer, 0, bufferSize);
+    if (!mapped) {
+        wgpuBufferUnmap(readbackBuffer);
+        wgpuBufferDestroy(readbackBuffer);
+        wgpuBufferRelease(readbackBuffer);
+        return false;
+    }
+
+    outPixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    const uint8_t* srcBytes = static_cast<const uint8_t*>(mapped);
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* srcRow = srcBytes + static_cast<size_t>(y) * static_cast<size_t>(alignedBytesPerRow);
+        uint8_t* dstRow = outPixels.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(width) * 4u);
+    }
+
+    wgpuBufferUnmap(readbackBuffer);
+    wgpuBufferDestroy(readbackBuffer);
+    wgpuBufferRelease(readbackBuffer);
+    return true;
+#else
     return false;
+#endif
 }
 
 void WebGPUBackend::ensureVertexArray(RenderHandle& ioVertexArray) {

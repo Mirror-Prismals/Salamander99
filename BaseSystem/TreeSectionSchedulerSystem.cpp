@@ -65,7 +65,12 @@ namespace TreeSectionSchedulerSystemLogic {
         const int syncRadiusXZ = std::max(0, readRegistryInt(baseSystem, "TreeSchedulerSyncRadiusXZ", 1));
         const int syncRadiusY = std::max(0, readRegistryInt(baseSystem, "TreeSchedulerSyncRadiusY", 1));
         const int syncSectionsPerFrame = std::max(0, readRegistryInt(baseSystem, "TreeSchedulerSyncSectionsPerFrame", 2));
+        const int forceCompleteSectionsPerFrame = std::max(
+            0,
+            readRegistryInt(baseSystem, "TreeSchedulerForceCompleteSectionsPerFrame", 1)
+        );
         const int syncPassesPerSection = std::max(1, readRegistryInt(baseSystem, "TreeSchedulerSyncPassesPerSection", 1));
+        (void)syncPassesPerSection;
 
         std::vector<std::pair<VoxelSectionKey, float>> syncCandidates;
         if (syncSectionsPerFrame > 0) {
@@ -85,7 +90,7 @@ namespace TreeSectionSchedulerSystemLogic {
             if (!TerrainSystemLogic::IsSectionTerrainReady(key)) {
                 continue;
             }
-            if (TreeGenerationSystemLogic::IsSectionFoliageReady(baseSystem, key)) {
+            if (TreeGenerationSystemLogic::IsSectionSurfaceFoliageReady(baseSystem, key)) {
                 continue;
             }
 
@@ -98,7 +103,10 @@ namespace TreeSectionSchedulerSystemLogic {
             syncCandidates.emplace_back(key, distanceSqToCamera(key.coord, sectionSize, cameraPosition));
         }
 
-        if (syncCandidates.empty()) return;
+        if (syncCandidates.empty()) {
+            TreeGenerationSystemLogic::SetForceCompleteSectionFoliageTargets({});
+            return;
+        }
 
         std::sort(
             syncCandidates.begin(),
@@ -112,15 +120,14 @@ namespace TreeSectionSchedulerSystemLogic {
         );
 
         const int syncCount = std::min(syncSectionsPerFrame, static_cast<int>(syncCandidates.size()));
-        for (int i = 0; i < syncCount; ++i) {
+        const int forceCompleteCount = std::min(forceCompleteSectionsPerFrame, syncCount);
+        std::vector<VoxelSectionKey> forceCompleteKeys;
+        forceCompleteKeys.reserve(static_cast<size_t>(std::max(0, forceCompleteCount)));
+        for (int i = 0; i < forceCompleteCount; ++i) {
             const VoxelSectionKey key = syncCandidates[static_cast<size_t>(i)].first;
-            if (TreeGenerationSystemLogic::IsSectionFoliageReady(baseSystem, key)) continue;
-            TreeGenerationSystemLogic::ProcessSectionSurfaceFoliageNow(
-                baseSystem,
-                prototypes,
-                key,
-                syncPassesPerSection
-            );
+            if (TreeGenerationSystemLogic::IsSectionSurfaceFoliageReady(baseSystem, key)) continue;
+            forceCompleteKeys.push_back(key);
         }
+        TreeGenerationSystemLogic::SetForceCompleteSectionFoliageTargets(forceCompleteKeys);
     }
 }

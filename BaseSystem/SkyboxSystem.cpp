@@ -1,7 +1,39 @@
 #pragma once
 #include "../Host.h"
+#include <algorithm>
+#include <cctype>
 
 namespace SkyboxSystemLogic {
+
+    namespace {
+        bool useAlternatePalette(const BaseSystem& baseSystem) {
+            if (!baseSystem.registry) return false;
+            auto it = baseSystem.registry->find("SkyboxAlternatePaletteEnabled");
+            if (it == baseSystem.registry->end()) return false;
+            if (std::holds_alternative<bool>(it->second)) {
+                return std::get<bool>(it->second);
+            }
+            if (std::holds_alternative<std::string>(it->second)) {
+                std::string value = std::get<std::string>(it->second);
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return value == "1" || value == "true" || value == "yes" || value == "on";
+            }
+            return false;
+        }
+
+        const std::vector<SkyColorKey>& alternateSkyKeys() {
+            static const std::vector<SkyColorKey> keys = {
+                {0.0f,  glm::vec3(0.0f,       0.0196078f, 0.1803922f), glm::vec3(0.6352941f, 0.8274510f, 0.9882353f)},
+                {0.25f, glm::vec3(0.0235294f, 0.0392157f, 0.0823529f), glm::vec3(0.0901961f, 0.1294118f, 0.1882353f)},
+                {0.5f,  glm::vec3(0.3843137f, 0.5568628f, 0.6823529f), glm::vec3(0.6666667f, 0.8627451f, 0.9568628f)},
+                {0.75f, glm::vec3(0.0f,       0.1568628f, 0.3647059f), glm::vec3(0.1843137f, 0.3960784f, 0.6235294f)},
+                {1.0f,  glm::vec3(0.0f,       0.0196078f, 0.1803922f), glm::vec3(0.6352941f, 0.8274510f, 0.9882353f)}
+            };
+            return keys;
+        }
+    }
 
     // Definition for getCurrentSkyColors now lives here
     void getCurrentSkyColors(float dayFraction, const std::vector<SkyColorKey>& skyKeys, glm::vec3& top, glm::vec3& bottom) {
@@ -14,6 +46,10 @@ namespace SkyboxSystemLogic {
         bottom = glm::mix(skyKeys[i].bottom, skyKeys[i + 1].bottom, t);
     }
 
+    void getCurrentSkyColors(const BaseSystem& baseSystem, float dayFraction, const std::vector<SkyColorKey>& skyKeys, glm::vec3& top, glm::vec3& bottom) {
+        getCurrentSkyColors(dayFraction, useAlternatePalette(baseSystem) ? alternateSkyKeys() : skyKeys, top, bottom);
+    }
+
     void RenderSkyAndCelestials(BaseSystem& baseSystem, const std::vector<Entity>& prototypes, const std::vector<glm::vec3>& starPositions, float time, float dayFraction, const glm::mat4& view, const glm::mat4& projection, const glm::vec3& playerPos, glm::vec3& outLightDir) {
         if (!baseSystem.renderer || !baseSystem.world || !baseSystem.renderBackend) return;
         RendererContext& renderer = *baseSystem.renderer;
@@ -21,7 +57,7 @@ namespace SkyboxSystemLogic {
         auto& renderBackend = *baseSystem.renderBackend;
 
         glm::vec3 skyTop, skyBottom;
-        getCurrentSkyColors(dayFraction, world.skyKeys, skyTop, skyBottom);
+        getCurrentSkyColors(baseSystem, dayFraction, world.skyKeys, skyTop, skyBottom);
 
         float hour = dayFraction * 24.0f;
         glm::vec3 sunDir, moonDir;

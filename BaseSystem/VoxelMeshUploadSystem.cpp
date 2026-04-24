@@ -19,9 +19,6 @@ namespace RenderInitSystemLogic {
     int getRegistryInt(const BaseSystem& baseSystem, const std::string& key, int fallback);
     bool getRegistryBool(const BaseSystem& baseSystem, const std::string& key, bool fallback);
     float getRegistryFloat(const BaseSystem& baseSystem, const std::string& key, float fallback);
-    bool shouldRenderVoxelSection(const BaseSystem& baseSystem,
-                                  const VoxelSection& section,
-                                  const glm::vec3& cameraPos);
 }
 namespace VoxelMeshInitSystemLogic {
     glm::vec3 UnpackColor(uint32_t packed);
@@ -944,10 +941,10 @@ namespace VoxelMeshUploadSystemLogic {
             return true;
         }
 
-        bool UploadPreparedVoxelSectionMesh(const PreparedVoxelSectionMesh& preparedMesh,
-                                            ChunkRenderBuffers& buffers,
-                                            RendererContext& renderer,
-                                            IRenderBackend& renderBackend) {
+        bool UploadPreparedVoxelSectionMeshImpl(const PreparedVoxelSectionMesh& preparedMesh,
+                                                ChunkRenderBuffers& buffers,
+                                                RendererContext& renderer,
+                                                IRenderBackend& renderBackend) {
             ::RenderInitSystemLogic::DestroyChunkRenderBuffers(buffers, renderBackend);
             buffers.counts.fill(0);
             buffers.usesTexturedFaceBuffers = preparedMesh.usesTexturedFaceBuffers;
@@ -955,22 +952,55 @@ namespace VoxelMeshUploadSystemLogic {
             for (int faceType = 0; faceType < 6; ++faceType) {
                 const auto& opaque = preparedMesh.opaqueFaces[static_cast<size_t>(faceType)];
                 if (!opaque.empty()) {
-                    renderBackend.ensureVertexArray(buffers.faceBuffers.opaqueVaos[static_cast<size_t>(faceType)]);
-                    renderBackend.ensureArrayBuffer(buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)]);
-                    renderBackend.uploadArrayBufferData(
-                        buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)],
-                        opaque.data(),
-                        opaque.size() * sizeof(FaceInstanceRenderData),
-                        false
-                    );
-                    renderBackend.configureVertexArray(
-                        buffers.faceBuffers.opaqueVaos[static_cast<size_t>(faceType)],
-                        renderer.faceVBO,
-                        FaceVertexLayout(),
-                        buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)],
-                        FaceInstanceLayout()
-                    );
-                    buffers.faceBuffers.opaqueCounts[static_cast<size_t>(faceType)] = static_cast<int>(opaque.size());
+                    std::vector<FaceInstanceRenderData> legacyOpaque;
+                    std::vector<FaceInstanceRenderData> clippedOpaque;
+                    legacyOpaque.reserve(opaque.size());
+                    clippedOpaque.reserve(opaque.size());
+                    for (const FaceInstanceRenderData& face : opaque) {
+                        if (face.alpha >= 0.999f) {
+                            clippedOpaque.push_back(face);
+                        } else {
+                            legacyOpaque.push_back(face);
+                        }
+                    }
+
+                    if (!legacyOpaque.empty()) {
+                        renderBackend.ensureVertexArray(buffers.faceBuffers.opaqueVaos[static_cast<size_t>(faceType)]);
+                        renderBackend.ensureArrayBuffer(buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)]);
+                        renderBackend.uploadArrayBufferData(
+                            buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)],
+                            legacyOpaque.data(),
+                            legacyOpaque.size() * sizeof(FaceInstanceRenderData),
+                            false
+                        );
+                        renderBackend.configureVertexArray(
+                            buffers.faceBuffers.opaqueVaos[static_cast<size_t>(faceType)],
+                            renderer.faceVBO,
+                            FaceVertexLayout(),
+                            buffers.faceBuffers.opaqueVBOs[static_cast<size_t>(faceType)],
+                            FaceInstanceLayout()
+                        );
+                        buffers.faceBuffers.opaqueCounts[static_cast<size_t>(faceType)] = static_cast<int>(legacyOpaque.size());
+                    }
+
+                    if (!clippedOpaque.empty()) {
+                        renderBackend.ensureVertexArray(buffers.faceBuffers.clippedOpaqueVaos[static_cast<size_t>(faceType)]);
+                        renderBackend.ensureArrayBuffer(buffers.faceBuffers.clippedOpaqueVBOs[static_cast<size_t>(faceType)]);
+                        renderBackend.uploadArrayBufferData(
+                            buffers.faceBuffers.clippedOpaqueVBOs[static_cast<size_t>(faceType)],
+                            clippedOpaque.data(),
+                            clippedOpaque.size() * sizeof(FaceInstanceRenderData),
+                            false
+                        );
+                        renderBackend.configureVertexArray(
+                            buffers.faceBuffers.clippedOpaqueVaos[static_cast<size_t>(faceType)],
+                            renderer.faceClippedVBO,
+                            FaceVertexLayout(),
+                            buffers.faceBuffers.clippedOpaqueVBOs[static_cast<size_t>(faceType)],
+                            FaceInstanceLayout()
+                        );
+                        buffers.faceBuffers.clippedOpaqueCounts[static_cast<size_t>(faceType)] = static_cast<int>(clippedOpaque.size());
+                    }
                 }
 
                 const auto& alpha = preparedMesh.alphaFaces[static_cast<size_t>(faceType)];
@@ -1039,6 +1069,128 @@ namespace VoxelMeshUploadSystemLogic {
             return true;
         }
 
+        glm::vec3 faceHalfExtents(int faceType, const glm::vec2& scale) {
+            switch (faceType) {
+                case 0:
+                case 1:
+                    return glm::vec3(0.5f, scale.y * 0.5f, scale.x * 0.5f);
+                case 2:
+                case 3:
+                    return glm::vec3(scale.x * 0.5f, 0.5f, scale.y * 0.5f);
+                case 4:
+                case 5:
+                    return glm::vec3(scale.x * 0.5f, scale.y * 0.5f, 0.5f);
+                default:
+                    return glm::vec3(0.5f);
+            }
+        }
+
+        glm::ivec3 clusterCoordForPosition(const glm::vec3& position,
+                                           const glm::vec3& sectionBase,
+                                           int clusterSize,
+                                           int sectionSize) {
+            const glm::vec3 local = position - sectionBase;
+            const auto coordAxis = [&](float v) -> int {
+                int c = static_cast<int>(std::floor(v / static_cast<float>(clusterSize)));
+                const int maxCoord = std::max(0, (sectionSize - 1) / clusterSize);
+                return std::clamp(c, 0, maxCoord);
+            };
+            return glm::ivec3(coordAxis(local.x), coordAxis(local.y), coordAxis(local.z));
+        }
+
+        uint64_t packClusterCoord(const glm::ivec3& coord) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(coord.x)) << 42u)
+                ^ (static_cast<uint64_t>(static_cast<uint32_t>(coord.y)) << 21u)
+                ^ static_cast<uint64_t>(static_cast<uint32_t>(coord.z));
+        }
+
+        struct ClusterPreparedMesh {
+            PreparedVoxelSectionMesh mesh;
+            glm::vec3 minBounds = glm::vec3(std::numeric_limits<float>::max());
+            glm::vec3 maxBounds = glm::vec3(-std::numeric_limits<float>::max());
+            bool hasBounds = false;
+        };
+
+        void expandClusterBounds(ClusterPreparedMesh& cluster,
+                                 const glm::vec3& minB,
+                                 const glm::vec3& maxB) {
+            if (!cluster.hasBounds) {
+                cluster.minBounds = minB;
+                cluster.maxBounds = maxB;
+                cluster.hasBounds = true;
+                return;
+            }
+            cluster.minBounds = glm::min(cluster.minBounds, minB);
+            cluster.maxBounds = glm::max(cluster.maxBounds, maxB);
+        }
+
+        void SplitPreparedMeshIntoClusters(const PreparedVoxelSectionMesh& preparedMesh,
+                                           const VoxelSection& section,
+                                           std::vector<VoxelRenderCluster>& outClusters,
+                                           RendererContext& renderer,
+                                           IRenderBackend& renderBackend) {
+            outClusters.clear();
+            const int clusterSizeBlocks = std::max(4, section.size / 2);
+            const glm::vec3 sectionBase(
+                static_cast<float>(section.coord.x * section.size),
+                static_cast<float>(section.coord.y * section.size),
+                static_cast<float>(section.coord.z * section.size)
+            );
+
+            std::unordered_map<uint64_t, ClusterPreparedMesh> clusterMeshes;
+            clusterMeshes.reserve(32);
+            auto getCluster = [&](const glm::ivec3& coord) -> ClusterPreparedMesh& {
+                const uint64_t key = packClusterCoord(coord);
+                ClusterPreparedMesh& cluster = clusterMeshes[key];
+                cluster.mesh.usesTexturedFaceBuffers = preparedMesh.usesTexturedFaceBuffers;
+                cluster.mesh.builtWithFaceCulling = preparedMesh.builtWithFaceCulling;
+                cluster.mesh.dirtyTicket = preparedMesh.dirtyTicket;
+                return cluster;
+            };
+
+            for (int faceType = 0; faceType < 6; ++faceType) {
+                for (const FaceInstanceRenderData& face : preparedMesh.opaqueFaces[static_cast<size_t>(faceType)]) {
+                    const glm::ivec3 clusterCoord = clusterCoordForPosition(face.position, sectionBase, clusterSizeBlocks, section.size);
+                    ClusterPreparedMesh& cluster = getCluster(clusterCoord);
+                    cluster.mesh.opaqueFaces[static_cast<size_t>(faceType)].push_back(face);
+                    const glm::vec3 halfExt = faceHalfExtents(faceType, face.scale);
+                    expandClusterBounds(cluster, face.position - halfExt, face.position + halfExt);
+                }
+                for (const FaceInstanceRenderData& face : preparedMesh.alphaFaces[static_cast<size_t>(faceType)]) {
+                    const glm::ivec3 clusterCoord = clusterCoordForPosition(face.position, sectionBase, clusterSizeBlocks, section.size);
+                    ClusterPreparedMesh& cluster = getCluster(clusterCoord);
+                    cluster.mesh.alphaFaces[static_cast<size_t>(faceType)].push_back(face);
+                    const glm::vec3 halfExt = faceHalfExtents(faceType, face.scale);
+                    expandClusterBounds(cluster, face.position - halfExt, face.position + halfExt);
+                }
+                for (const WaterFaceInstanceRenderData& face : preparedMesh.waterSurfaceFaces[static_cast<size_t>(faceType)]) {
+                    const glm::ivec3 clusterCoord = clusterCoordForPosition(face.position, sectionBase, clusterSizeBlocks, section.size);
+                    ClusterPreparedMesh& cluster = getCluster(clusterCoord);
+                    cluster.mesh.waterSurfaceFaces[static_cast<size_t>(faceType)].push_back(face);
+                    const glm::vec3 halfExt = faceHalfExtents(faceType, face.scale);
+                    expandClusterBounds(cluster, face.position - halfExt, face.position + halfExt);
+                }
+                for (const WaterFaceInstanceRenderData& face : preparedMesh.waterBodyFaces[static_cast<size_t>(faceType)]) {
+                    const glm::ivec3 clusterCoord = clusterCoordForPosition(face.position, sectionBase, clusterSizeBlocks, section.size);
+                    ClusterPreparedMesh& cluster = getCluster(clusterCoord);
+                    cluster.mesh.waterBodyFaces[static_cast<size_t>(faceType)].push_back(face);
+                    const glm::vec3 halfExt = faceHalfExtents(faceType, face.scale);
+                    expandClusterBounds(cluster, face.position - halfExt, face.position + halfExt);
+                }
+            }
+
+            outClusters.reserve(clusterMeshes.size());
+            for (auto& [key, clusterMesh] : clusterMeshes) {
+                (void)key;
+                if (!clusterMesh.hasBounds) continue;
+                VoxelRenderCluster cluster{};
+                cluster.minBounds = clusterMesh.minBounds;
+                cluster.maxBounds = clusterMesh.maxBounds;
+                UploadPreparedVoxelSectionMeshImpl(clusterMesh.mesh, cluster.buffers, renderer, renderBackend);
+                outClusters.push_back(std::move(cluster));
+            }
+        }
+
         float sectionDist2ToCamera(const VoxelSection& section, const glm::vec3& cameraPos) {
             const int scale = 1;
             const float span = static_cast<float>(section.size * scale);
@@ -1066,6 +1218,13 @@ namespace VoxelMeshUploadSystemLogic {
             const glm::vec3 delta = center - cameraPos;
             return glm::dot(delta, delta);
         }
+    }
+
+    bool UploadPreparedVoxelSectionMesh(const PreparedVoxelSectionMesh& preparedMesh,
+                                        ChunkRenderBuffers& buffers,
+                                        RendererContext& renderer,
+                                        IRenderBackend& renderBackend) {
+        return UploadPreparedVoxelSectionMeshImpl(preparedMesh, buffers, renderer, renderBackend);
     }
 
     std::vector<VoxelMeshingPrototypeTraits> BuildVoxelMeshingPrototypeTraits(const BaseSystem& baseSystem,
@@ -1390,6 +1549,13 @@ namespace VoxelMeshUploadSystemLogic {
             for (const auto& key : staleSections) {
                 ::RenderInitSystemLogic::DestroyChunkRenderBuffers(voxelRender.renderBuffers[key], renderBackend);
                 voxelRender.renderBuffers.erase(key);
+                auto clustersIt = voxelRender.renderClusters.find(key);
+                if (clustersIt != voxelRender.renderClusters.end()) {
+                    for (VoxelRenderCluster& cluster : clustersIt->second) {
+                        ::RenderInitSystemLogic::DestroyChunkRenderBuffers(cluster.buffers, renderBackend);
+                    }
+                    voxelRender.renderClusters.erase(clustersIt);
+                }
             }
 
             std::vector<VoxelSectionKey> stalePrepared;
@@ -1408,6 +1574,7 @@ namespace VoxelMeshUploadSystemLogic {
             }
             for (const auto& key : stalePrepared) {
                 voxelRender.preparedMeshes.erase(key);
+                voxelRender.wireframeMeshes.erase(key);
                 voxelRender.renderBuffersDirty.erase(key);
             }
             for (const auto& key : clearDirty) {
@@ -1507,7 +1674,6 @@ namespace VoxelMeshUploadSystemLogic {
                 struct Candidate {
                     VoxelSectionKey key;
                     float dist2 = 0.0f;
-                    bool visible = false;
                 };
                 std::vector<Candidate> candidates;
                 candidates.reserve(voxelRender.renderBuffersDirty.size());
@@ -1517,12 +1683,10 @@ namespace VoxelMeshUploadSystemLogic {
                     if (!isRenderableSection(key)) continue;
                     candidates.push_back({
                         key,
-                        sectionDist2ToCamera(it->second, playerPos),
-                        ::RenderInitSystemLogic::shouldRenderVoxelSection(baseSystem, it->second, playerPos)
+                        sectionDist2ToCamera(it->second, playerPos)
                     });
                 }
                 std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-                    if (a.visible != b.visible) return a.visible && !b.visible;
                     if (a.dist2 != b.dist2) return a.dist2 < b.dist2;
                     if (a.key.coord.x != b.key.coord.x) return a.key.coord.x < b.key.coord.x;
                     if (a.key.coord.y != b.key.coord.y) return a.key.coord.y < b.key.coord.y;
@@ -1540,6 +1704,7 @@ namespace VoxelMeshUploadSystemLogic {
                         || it->second.nonAirCount <= 0
                         || !isRenderableSection(c.key)) {
                         voxelRender.preparedMeshes.erase(c.key);
+                        voxelRender.wireframeMeshes.erase(c.key);
                         voxelRender.renderBuffersDirty.erase(c.key);
                         if (it == voxelWorld.sections.end() || it->second.nonAirCount <= 0) {
                             voxelWorld.clearSectionDirty(c.key);
@@ -1555,6 +1720,7 @@ namespace VoxelMeshUploadSystemLogic {
                     const uint64_t currentDirtyTicket = voxelWorld.getSectionDirtyTicket(c.key);
                     if (currentDirtyTicket == 0) {
                         voxelRender.preparedMeshes.erase(preparedIt);
+                        voxelRender.wireframeMeshes.erase(c.key);
                         voxelRender.renderBuffersDirty.erase(c.key);
                         continue;
                     }
@@ -1564,12 +1730,26 @@ namespace VoxelMeshUploadSystemLogic {
                         continue;
                     }
 
-                    if (UploadPreparedVoxelSectionMesh(
+                    {
+                        ::RenderInitSystemLogic::DestroyChunkRenderBuffers(voxelRender.renderBuffers[c.key], renderBackend);
+                        voxelRender.renderBuffers[c.key] = ChunkRenderBuffers{};
+                        voxelRender.renderBuffers[c.key].usesTexturedFaceBuffers = preparedIt->second.usesTexturedFaceBuffers;
+                        voxelRender.renderBuffers[c.key].builtWithFaceCulling = preparedIt->second.builtWithFaceCulling;
+                        auto existingClusters = voxelRender.renderClusters.find(c.key);
+                        if (existingClusters != voxelRender.renderClusters.end()) {
+                            for (VoxelRenderCluster& cluster : existingClusters->second) {
+                                ::RenderInitSystemLogic::DestroyChunkRenderBuffers(cluster.buffers, renderBackend);
+                            }
+                        }
+                        SplitPreparedMeshIntoClusters(
                             preparedIt->second,
-                            voxelRender.renderBuffers[c.key],
+                            it->second,
+                            voxelRender.renderClusters[c.key],
                             renderer,
-                            renderBackend)) {
-                        voxelRender.preparedMeshes.erase(c.key);
+                            renderBackend
+                        );
+                        voxelRender.wireframeMeshes[c.key] = std::move(preparedIt->second);
+                        voxelRender.preparedMeshes.erase(preparedIt);
                         voxelRender.renderBuffersDirty.erase(c.key);
                         voxelWorld.clearSectionDirty(c.key);
                         ++uploadCount;

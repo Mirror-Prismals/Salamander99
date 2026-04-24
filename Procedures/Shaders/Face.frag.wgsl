@@ -71,10 +71,19 @@ struct FSIn {
     @location(5) instanceCell: vec3<f32>,
     @location(6) @interpolate(flat) tileIndex: i32,
     @location(7) alpha: f32,
-    @location(8) ao: f32,
+    @location(8) aoCorners: vec4<f32>,
     @location(9) screenUv: vec2<f32>,
+    @location(10) localRectUv: vec2<f32>,
     @builtin(front_facing) frontFacing: bool,
 };
+
+fn bilinearAo(corners: vec4<f32>, uv: vec2<f32>) -> f32 {
+    let u = clamp(uv.x, 0.0, 1.0);
+    let v = clamp(uv.y, 0.0, 1.0);
+    let bottom = mix(corners.x, corners.y, u);
+    let top = mix(corners.w, corners.z, u);
+    return mix(bottom, top, v);
+}
 
 fn noise(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
@@ -369,6 +378,11 @@ fn waterBlockGlassAlpha(worldPos: vec3<f32>, normalIn: vec3<f32>, decodedAo: f32
 
 @fragment
 fn fs_main(input: FSIn) -> @location(0) vec4<f32> {
+    if (input.localRectUv.x < 0.0 || input.localRectUv.x > 1.0
+        || input.localRectUv.y < 0.0 || input.localRectUv.y > 1.0) {
+        discard;
+    }
+
     let behaviorType = u.intParams0.x;
     let wireframeDebug = u.intParams0.y;
     let blockDamageEnabled = u.intParams0.z;
@@ -433,7 +447,7 @@ fn fs_main(input: FSIn) -> @location(0) vec4<f32> {
     let underwaterCausticsAoEncodeStride = 2.0;
     let shorelineWaterAoEncodeStride = 4.0;
     let waterfallFoamAoEncodeStride = 64.0;
-    var decodedAo = input.ao;
+    var decodedAo = bilinearAo(input.aoCorners, input.localRectUv);
     var waterfallFoamFaceTagged = false;
     if (decodedAo >= waterfallFoamAoEncodeStride) {
         waterfallFoamFaceTagged = true;

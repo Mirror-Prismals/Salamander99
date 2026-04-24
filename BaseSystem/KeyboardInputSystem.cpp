@@ -67,6 +67,26 @@ namespace KeyboardInputSystemLogic {
     }
 
     void ProcessKeyboardInput(BaseSystem& baseSystem, std::vector<Entity>& prototypes, float dt, PlatformWindowHandle win) {
+        static bool j_pressed_last_frame = false;
+        const bool j_pressed = PlatformInput::IsKeyDown(win, PlatformInput::Key::J);
+        if (j_pressed && !j_pressed_last_frame) {
+            FrustumCullingSystemLogic::SetDebugFrozen(
+                baseSystem,
+                !FrustumCullingSystemLogic::IsDebugFrozen(baseSystem)
+            );
+        }
+        j_pressed_last_frame = j_pressed;
+
+        static bool h_pressed_last_frame = false;
+        const bool h_pressed = PlatformInput::IsKeyDown(win, PlatformInput::Key::H);
+        if (h_pressed && !h_pressed_last_frame) {
+            OcclusionCullingSystemLogic::SetDebugFrozen(
+                baseSystem,
+                !OcclusionCullingSystemLogic::IsDebugFrozen(baseSystem)
+            );
+        }
+        h_pressed_last_frame = h_pressed;
+
         if (!baseSystem.level || baseSystem.level->worlds.empty()) return;
         if (baseSystem.ui && baseSystem.ui->active) return;
         if (OreMiningSystemLogic::IsMiningActive(baseSystem)) return;
@@ -177,6 +197,7 @@ namespace KeyboardInputSystemLogic {
                 baseSystem.gems->heldDrop.upsideDown = !baseSystem.gems->heldDrop.upsideDown;
             }
             g_pressed_last_frame = g_pressed;
+
         }
     }
 }

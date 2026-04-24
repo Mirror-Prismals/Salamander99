@@ -66,6 +66,9 @@ bool Host::checkDependencies(const std::vector<std::string>& deps) {
         if (dep == "RendererContext" && !baseSystem.renderer) return false;
         if (dep == "VoxelWorldContext" && !baseSystem.voxelWorld) return false;
         if (dep == "VoxelRenderContext" && !baseSystem.voxelRender) return false;
+        if (dep == "FarTerrainClipmapContext" && !baseSystem.farTerrain) return false;
+        if (dep == "FrustumCullingContext" && !baseSystem.frustumCulling) return false;
+        if (dep == "OcclusionCullingContext" && !baseSystem.occlusionCulling) return false;
         if (dep == "RegistryContext" && !baseSystem.registry) return false;
         if (dep == "AudioContext" && !baseSystem.audio) return false;
         if (dep == "RayTracedAudioContext" && !baseSystem.rayTracedAudio) return false;

@@ -2,7 +2,9 @@
 #include "Host/PlatformInput.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
+#include <unordered_set>
 #include <vector>
 
 namespace ExpanseBiomeSystemLogic { bool SampleTerrain(const WorldContext& worldCtx, float x, float z, float& outHeight); }
@@ -24,6 +26,253 @@ namespace OverlayRenderSystemLogic {
             glm::vec3 position;
             glm::vec3 color;
         };
+
+        struct WireframeVertexKey {
+            int x2 = 0;
+            int y2 = 0;
+            int z2 = 0;
+
+            bool operator==(const WireframeVertexKey& other) const noexcept {
+                return x2 == other.x2 && y2 == other.y2 && z2 == other.z2;
+            }
+        };
+
+        struct WireframeVertexKeyHash {
+            size_t operator()(const WireframeVertexKey& key) const noexcept {
+                size_t h = std::hash<int>()(key.x2);
+                h ^= std::hash<int>()(key.y2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+                h ^= std::hash<int>()(key.z2) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+                return h;
+            }
+        };
+
+        struct WireframeEdgeKey {
+            WireframeVertexKey a{};
+            WireframeVertexKey b{};
+            uint8_t colorClass = 0;
+
+            bool operator==(const WireframeEdgeKey& other) const noexcept {
+                return a == other.a && b == other.b && colorClass == other.colorClass;
+            }
+        };
+
+        struct WireframeEdgeKeyHash {
+            size_t operator()(const WireframeEdgeKey& key) const noexcept {
+                WireframeVertexKeyHash vertexHash;
+                size_t h = vertexHash(key.a);
+                h ^= vertexHash(key.b) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+                h ^= std::hash<int>()(static_cast<int>(key.colorClass)) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+                return h;
+            }
+        };
+
+        struct TerrainWireframeStats {
+            size_t nearFaceCount = 0;
+            size_t farFaceCount = 0;
+            size_t lineSegmentCount = 0;
+        };
+
+        struct TerrainWireframeCache {
+            uint64_t nearSignature = 0;
+            uint64_t farSignature = 0;
+            std::vector<LeyLineDebugVertex> vertices;
+            TerrainWireframeStats stats{};
+            bool valid = false;
+        };
+
+        WireframeVertexKey makeWireframeVertexKey(const glm::vec3& p) {
+            return WireframeVertexKey{
+                static_cast<int>(std::lround(static_cast<double>(p.x * 2.0f))),
+                static_cast<int>(std::lround(static_cast<double>(p.y * 2.0f))),
+                static_cast<int>(std::lround(static_cast<double>(p.z * 2.0f)))
+            };
+        }
+
+        glm::vec3 wireframeVertexPosition(const WireframeVertexKey& key) {
+            return glm::vec3(
+                static_cast<float>(key.x2) * 0.5f,
+                static_cast<float>(key.y2) * 0.5f,
+                static_cast<float>(key.z2) * 0.5f
+            );
+        }
+
+        void getTerrainWireframeFaceCorners(glm::vec3 (&corners)[4],
+                                            int faceType,
+                                            const FaceInstanceRenderData& face) {
+            if (faceType == 0 || faceType == 1) {
+                const float x = face.position.x;
+                const float z0 = face.position.z - face.scale.x * 0.5f;
+                const float z1 = face.position.z + face.scale.x * 0.5f;
+                const float y0 = face.position.y - face.scale.y * 0.5f;
+                const float y1 = face.position.y + face.scale.y * 0.5f;
+                corners[0] = glm::vec3(x, y0, z0);
+                corners[1] = glm::vec3(x, y1, z0);
+                corners[2] = glm::vec3(x, y1, z1);
+                corners[3] = glm::vec3(x, y0, z1);
+            } else if (faceType == 2 || faceType == 3) {
+                const float y = face.position.y;
+                const float x0 = face.position.x - face.scale.x * 0.5f;
+                const float x1 = face.position.x + face.scale.x * 0.5f;
+                const float z0 = face.position.z - face.scale.y * 0.5f;
+                const float z1 = face.position.z + face.scale.y * 0.5f;
+                corners[0] = glm::vec3(x0, y, z0);
+                corners[1] = glm::vec3(x1, y, z0);
+                corners[2] = glm::vec3(x1, y, z1);
+                corners[3] = glm::vec3(x0, y, z1);
+            } else {
+                const float z = face.position.z;
+                const float x0 = face.position.x - face.scale.x * 0.5f;
+                const float x1 = face.position.x + face.scale.x * 0.5f;
+                const float y0 = face.position.y - face.scale.y * 0.5f;
+                const float y1 = face.position.y + face.scale.y * 0.5f;
+                corners[0] = glm::vec3(x0, y0, z);
+                corners[1] = glm::vec3(x1, y0, z);
+                corners[2] = glm::vec3(x1, y1, z);
+                corners[3] = glm::vec3(x0, y1, z);
+            }
+        }
+
+        uint64_t hashMixU64(uint64_t h, uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+            return h;
+        }
+
+        uint64_t computeNearWireframeSignature(const BaseSystem& baseSystem) {
+            if (!baseSystem.voxelRender) return 0;
+            const auto& sourceMeshes = !baseSystem.voxelRender->wireframeMeshes.empty()
+                ? baseSystem.voxelRender->wireframeMeshes
+                : baseSystem.voxelRender->preparedMeshes;
+            uint64_t h = 1469598103934665603ull;
+            for (const auto& [key, prepared] : sourceMeshes) {
+                const auto renderIt = baseSystem.voxelRender->renderBuffers.find(key);
+                if (renderIt == baseSystem.voxelRender->renderBuffers.end()) continue;
+                const VoxelChunkLifecycleState* state = baseSystem.voxelWorld
+                    ? baseSystem.voxelWorld->findChunkState(key)
+                    : nullptr;
+                if (!state || !state->isRenderable()) continue;
+                h = hashMixU64(h, static_cast<uint64_t>(static_cast<uint32_t>(key.coord.x)));
+                h = hashMixU64(h, static_cast<uint64_t>(static_cast<uint32_t>(key.coord.y)));
+                h = hashMixU64(h, static_cast<uint64_t>(static_cast<uint32_t>(key.coord.z)));
+                h = hashMixU64(h, prepared.dirtyTicket);
+                for (int faceType = 0; faceType < 6; ++faceType) {
+                    h = hashMixU64(h, prepared.opaqueFaces[static_cast<size_t>(faceType)].size());
+                    h = hashMixU64(h, prepared.alphaFaces[static_cast<size_t>(faceType)].size());
+                }
+            }
+            return h;
+        }
+
+        uint64_t computeFarWireframeSignature(const BaseSystem& baseSystem) {
+            if (!baseSystem.farTerrain || !baseSystem.farTerrain->enabled) return 0;
+            const FarTerrainClipmapContext& far = *baseSystem.farTerrain;
+            uint64_t h = 1469598103934665603ull;
+            h = hashMixU64(h, far.rebuildCount);
+            h = hashMixU64(h, far.lastBuildFrame);
+            h = hashMixU64(h, far.visibleFaceCount);
+            h = hashMixU64(h, far.handoffVisibleFaceCount);
+            h = hashMixU64(h, far.bodyVisibleFaceCount);
+            return h;
+        }
+
+        void appendTerrainWireframeFace(std::vector<LeyLineDebugVertex>& vertices,
+                                        std::unordered_set<WireframeEdgeKey, WireframeEdgeKeyHash>& uniqueEdges,
+                                        int faceType,
+                                        const FaceInstanceRenderData& face,
+                                        const glm::vec3& color,
+                                        uint8_t colorClass) {
+            glm::vec3 corners[4];
+            getTerrainWireframeFaceCorners(corners, faceType, face);
+
+            auto pushUniqueLine = [&](const glm::vec3& a, const glm::vec3& b) {
+                WireframeVertexKey ka = makeWireframeVertexKey(a);
+                WireframeVertexKey kb = makeWireframeVertexKey(b);
+                if (kb.x2 < ka.x2
+                    || (kb.x2 == ka.x2 && kb.y2 < ka.y2)
+                    || (kb.x2 == ka.x2 && kb.y2 == ka.y2 && kb.z2 < ka.z2)) {
+                    std::swap(ka, kb);
+                }
+                WireframeEdgeKey edge{ka, kb, colorClass};
+                if (!uniqueEdges.insert(edge).second) return;
+                vertices.push_back({wireframeVertexPosition(ka), color});
+                vertices.push_back({wireframeVertexPosition(kb), color});
+            };
+            auto pushDiagonal = [&](const glm::vec3& a, const glm::vec3& b) {
+                vertices.push_back({a, color});
+                vertices.push_back({b, color});
+            };
+            pushUniqueLine(corners[0], corners[1]);
+            pushUniqueLine(corners[1], corners[2]);
+            pushUniqueLine(corners[2], corners[3]);
+            pushUniqueLine(corners[3], corners[0]);
+            pushDiagonal(corners[0], corners[2]);
+        }
+
+        const std::vector<LeyLineDebugVertex>& buildTerrainTriangleWireframeVertices(BaseSystem& baseSystem) {
+            static TerrainWireframeCache cache;
+
+            const glm::vec3 nearColor(0.95f, 0.95f, 0.95f);
+            const glm::vec3 nearAlphaColor(0.72f, 0.88f, 0.72f);
+            const glm::vec3 farColor(1.00f, 0.72f, 0.20f);
+            const uint64_t nearSignature = computeNearWireframeSignature(baseSystem);
+            const uint64_t farSignature = computeFarWireframeSignature(baseSystem);
+
+            if (!cache.valid || cache.nearSignature != nearSignature || cache.farSignature != farSignature) {
+                cache.vertices.clear();
+                cache.stats = {};
+                std::unordered_set<WireframeEdgeKey, WireframeEdgeKeyHash> uniqueEdges;
+                uniqueEdges.reserve(65536);
+
+                if (baseSystem.voxelRender) {
+                    const auto& sourceMeshes = !baseSystem.voxelRender->wireframeMeshes.empty()
+                        ? baseSystem.voxelRender->wireframeMeshes
+                        : baseSystem.voxelRender->preparedMeshes;
+                    for (const auto& [key, prepared] : sourceMeshes) {
+                        const auto renderIt = baseSystem.voxelRender->renderBuffers.find(key);
+                        if (renderIt == baseSystem.voxelRender->renderBuffers.end()) continue;
+                        const VoxelChunkLifecycleState* state = baseSystem.voxelWorld
+                            ? baseSystem.voxelWorld->findChunkState(key)
+                            : nullptr;
+                        if (!state || !state->isRenderable()) continue;
+                        for (int faceType = 0; faceType < 6; ++faceType) {
+                            for (const FaceInstanceRenderData& face : prepared.opaqueFaces[static_cast<size_t>(faceType)]) {
+                                appendTerrainWireframeFace(cache.vertices, uniqueEdges, faceType, face, nearColor, 0);
+                                cache.stats.nearFaceCount += 1;
+                            }
+                            for (const FaceInstanceRenderData& face : prepared.alphaFaces[static_cast<size_t>(faceType)]) {
+                                appendTerrainWireframeFace(cache.vertices, uniqueEdges, faceType, face, nearAlphaColor, 1);
+                                cache.stats.nearFaceCount += 1;
+                            }
+                        }
+                    }
+                }
+
+                if (baseSystem.farTerrain && baseSystem.farTerrain->enabled) {
+                    const auto appendFarSet = [&](const std::array<std::vector<FaceInstanceRenderData>, 6>& faces) {
+                        for (int faceType = 0; faceType < 6; ++faceType) {
+                            for (const FaceInstanceRenderData& face : faces[static_cast<size_t>(faceType)]) {
+                                appendTerrainWireframeFace(cache.vertices, uniqueEdges, faceType, face, farColor, 2);
+                                cache.stats.farFaceCount += 1;
+                            }
+                        }
+                    };
+                    appendFarSet(baseSystem.farTerrain->bodyFaces);
+                    appendFarSet(baseSystem.farTerrain->handoffFaces);
+                }
+
+                cache.stats.lineSegmentCount = cache.vertices.size() / 2u;
+                cache.nearSignature = nearSignature;
+                cache.farSignature = farSignature;
+                cache.valid = true;
+            }
+
+            if (baseSystem.voxelRender) {
+                baseSystem.voxelRender->wireframeOverlayNearFaces = cache.stats.nearFaceCount;
+                baseSystem.voxelRender->wireframeOverlayFarFaces = cache.stats.farFaceCount;
+                baseSystem.voxelRender->wireframeOverlayLineSegments = cache.stats.lineSegmentCount;
+            }
+
+            return cache.vertices;
+        }
 
         bool readRegistryBool(const BaseSystem& baseSystem, const char* key, bool fallback) {
             if (!baseSystem.registry) return fallback;
@@ -390,6 +639,36 @@ namespace OverlayRenderSystemLogic {
                 setLineWidth(1.0f);
                 setDepthWriteEnabled(true);
             }
+        }
+
+        const bool sceneTriangleWireframeDebugEnabled = readRegistryBool(baseSystem, "SceneTriangleWireframeDebugEnabled", false);
+        if (sceneTriangleWireframeDebugEnabled
+            && renderer.audioRayShader
+            && renderer.leyLineDebugVAO
+            && renderer.leyLineDebugVBO) {
+            const std::vector<LeyLineDebugVertex>& vertices = buildTerrainTriangleWireframeVertices(baseSystem);
+            if (!vertices.empty()) {
+                renderBackend.uploadArrayBufferData(
+                    renderer.leyLineDebugVBO,
+                    vertices.data(),
+                    vertices.size() * sizeof(LeyLineDebugVertex),
+                    true
+                );
+                setDepthWriteEnabled(false);
+                setBlendEnabled(true);
+                renderer.audioRayShader->use();
+                renderer.audioRayShader->setMat4("view", view);
+                renderer.audioRayShader->setMat4("projection", projection);
+                renderBackend.bindVertexArray(renderer.leyLineDebugVAO);
+                setLineWidth(1.1f);
+                renderBackend.drawArraysLines(0, static_cast<int>(vertices.size()));
+                setLineWidth(1.0f);
+                setDepthWriteEnabled(true);
+            }
+        } else if (baseSystem.voxelRender) {
+            baseSystem.voxelRender->wireframeOverlayNearFaces = 0;
+            baseSystem.voxelRender->wireframeOverlayFarFaces = 0;
+            baseSystem.voxelRender->wireframeOverlayLineSegments = 0;
         }
 
         GemSystemLogic::RenderGems(baseSystem, prototypes, dt, win);

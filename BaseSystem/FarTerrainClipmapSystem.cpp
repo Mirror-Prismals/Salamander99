@@ -1,0 +1,2403 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <unordered_map>
+
+namespace {
+    struct FarTerrainBuildPerfStats {
+        double cellResolveMs = 0.0;
+        double topGreedyMs = 0.0;
+        double topMergeMs = 0.0;
+        double verticalBuildMs = 0.0;
+        double clusterPrepMs = 0.0;
+        double clusterUploadMs = 0.0;
+    };
+
+    bool farTerrainGetRegistryBool(const BaseSystem& baseSystem, const std::string& key, bool fallback) {
+        if (!baseSystem.registry) return fallback;
+        auto it = baseSystem.registry->find(key);
+        if (it == baseSystem.registry->end()) return fallback;
+        if (!std::holds_alternative<bool>(it->second)) return fallback;
+        return std::get<bool>(it->second);
+    }
+
+    int farTerrainGetRegistryInt(const BaseSystem& baseSystem, const std::string& key, int fallback) {
+        if (!baseSystem.registry) return fallback;
+        auto it = baseSystem.registry->find(key);
+        if (it == baseSystem.registry->end()) return fallback;
+        if (!std::holds_alternative<std::string>(it->second)) return fallback;
+        try {
+            return std::stoi(std::get<std::string>(it->second));
+        } catch (...) {
+            return fallback;
+        }
+    }
+
+    float farTerrainGetRegistryFloat(const BaseSystem& baseSystem, const std::string& key, float fallback) {
+        if (!baseSystem.registry) return fallback;
+        auto it = baseSystem.registry->find(key);
+        if (it == baseSystem.registry->end()) return fallback;
+        if (!std::holds_alternative<std::string>(it->second)) return fallback;
+        try {
+            return std::stof(std::get<std::string>(it->second));
+        } catch (...) {
+            return fallback;
+        }
+    }
+
+    std::string farTerrainGetRegistryString(const BaseSystem& baseSystem,
+                                            const std::string& key,
+                                            const std::string& fallback) {
+        if (!baseSystem.registry) return fallback;
+        auto it = baseSystem.registry->find(key);
+        if (it == baseSystem.registry->end()) return fallback;
+        if (!std::holds_alternative<std::string>(it->second)) return fallback;
+        return std::get<std::string>(it->second);
+    }
+
+    uint32_t farTerrainHash2DInt(int x, int z) {
+        uint32_t ux = static_cast<uint32_t>(x) * 73856093u;
+        uint32_t uz = static_cast<uint32_t>(z) * 19349663u;
+        uint32_t h = ux ^ uz;
+        h ^= (h >> 13);
+        h *= 1274126177u;
+        h ^= (h >> 16);
+        return h;
+    }
+
+    float farTerrainHashToUnitFloat01(uint32_t h) {
+        return static_cast<float>(h & 0x00ffffffu) / 16777215.0f;
+    }
+
+    int farTerrainFloorDiv(int value, int divisor) {
+        if (divisor <= 0) return 0;
+        if (value >= 0) return value / divisor;
+        return -(((-value) + divisor - 1) / divisor);
+    }
+
+    float farTerrainSmoothstep01(float t) {
+        t = std::clamp(t, 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    float farTerrainValueNoise2D(int seed, float x, float z) {
+        const int ix = static_cast<int>(std::floor(x));
+        const int iz = static_cast<int>(std::floor(z));
+        const float fx = x - static_cast<float>(ix);
+        const float fz = z - static_cast<float>(iz);
+        const float u = farTerrainSmoothstep01(fx);
+        const float v = farTerrainSmoothstep01(fz);
+        auto sample = [&](int gx, int gz) -> float {
+            return farTerrainHashToUnitFloat01(farTerrainHash2DInt(gx + seed * 37, gz - seed * 53));
+        };
+        const float n00 = sample(ix, iz);
+        const float n10 = sample(ix + 1, iz);
+        const float n01 = sample(ix, iz + 1);
+        const float n11 = sample(ix + 1, iz + 1);
+        const float nx0 = n00 + (n10 - n00) * u;
+        const float nx1 = n01 + (n11 - n01) * u;
+        return nx0 + (nx1 - nx0) * v;
+    }
+
+    float farTerrainFbmValueNoise2D(int seed,
+                                    float x,
+                                    float z,
+                                    int octaves,
+                                    float lacunarity = 2.0f,
+                                    float gain = 0.5f) {
+        const int oct = std::max(1, octaves);
+        float sum = 0.0f;
+        float amplitude = 1.0f;
+        float frequency = 1.0f;
+        float norm = 0.0f;
+        for (int i = 0; i < oct; ++i) {
+            sum += farTerrainValueNoise2D(seed + i * 911, x * frequency, z * frequency) * amplitude;
+            norm += amplitude;
+            amplitude *= gain;
+            frequency *= lacunarity;
+        }
+        if (norm <= 0.0f) return 0.0f;
+        return sum / norm;
+    }
+
+    int farTerrainConservativeMaxY(const BaseSystem& baseSystem, const WorldContext& world) {
+        const ExpanseConfig& cfg = world.expanse;
+        int maxY = static_cast<int>(std::ceil(cfg.baseElevation + cfg.mountainElevation));
+        if (cfg.islandRadius > 0.0f) {
+            maxY = static_cast<int>(std::ceil(
+                cfg.waterSurface + cfg.islandMaxHeight + (cfg.islandNoiseAmp * 2.0f)
+            ));
+        }
+        maxY = std::max(maxY, static_cast<int>(std::ceil(cfg.waterSurface)));
+        if (world.leyLines.enabled && world.leyLines.loaded) {
+            float upliftBudget = std::max(0.0f, world.leyLines.upliftMax);
+            if (world.leyLines.mountainLayerEnabled && world.leyLines.mountainLayerStrength > 0.0f) {
+                upliftBudget += upliftBudget * world.leyLines.mountainLayerStrength;
+            }
+            maxY += static_cast<int>(std::ceil(upliftBudget));
+        }
+        maxY += std::max(0, farTerrainGetRegistryInt(baseSystem, "ExpanseVerticalHeadroom", 48));
+        maxY = std::max(maxY, farTerrainGetRegistryInt(baseSystem, "ExpanseAbsoluteMaxY", 320));
+        return maxY;
+    }
+
+    int farTerrainAngleBucket(float degrees, float bucketDegrees, float offset) {
+        const float safeBucket = std::max(1.0f, bucketDegrees);
+        return static_cast<int>(std::floor((degrees + offset) / safeBucket));
+    }
+
+    float farTerrainHorizontalHalfFovDegrees(const BaseSystem& baseSystem) {
+        if (!baseSystem.player) return 60.0f;
+        const float m00 = baseSystem.player->projectionMatrix[0][0];
+        if (std::abs(m00) <= 1e-5f) return 60.0f;
+        return glm::degrees(std::atan(1.0f / m00));
+    }
+
+    glm::vec2 farTerrainCameraForwardXZ(const BaseSystem& baseSystem) {
+        if (!baseSystem.player) return glm::vec2(0.0f, -1.0f);
+        const float yawRadians = glm::radians(FrustumCullingSystemLogic::GetCullingCameraYaw(baseSystem));
+        glm::vec2 forward(std::cos(yawRadians), std::sin(yawRadians));
+        const float len2 = glm::dot(forward, forward);
+        if (len2 <= 1e-6f) return glm::vec2(0.0f, -1.0f);
+        return forward / std::sqrt(len2);
+    }
+
+    bool farTerrainHorizontalSectorVisible(const BaseSystem& baseSystem,
+                                           int minX,
+                                           int minZ,
+                                           int maxX,
+                                           int maxZ) {
+        if (!baseSystem.player) return true;
+        const glm::vec3 cullingCameraPos = FrustumCullingSystemLogic::GetCullingCameraPosition(baseSystem);
+        const glm::vec2 cameraXZ(cullingCameraPos.x, cullingCameraPos.z);
+        const glm::vec2 forwardXZ = farTerrainCameraForwardXZ(baseSystem);
+        const glm::vec2 center(
+            0.5f * static_cast<float>(minX + maxX),
+            0.5f * static_cast<float>(minZ + maxZ)
+        );
+        const glm::vec2 toCenter = center - cameraXZ;
+        const float distanceSquared = glm::dot(toCenter, toCenter);
+        if (distanceSquared <= 1e-4f) return true;
+
+        const float halfWidth = 0.5f * static_cast<float>(maxX - minX);
+        const float halfDepth = 0.5f * static_cast<float>(maxZ - minZ);
+        const float boundRadius = std::sqrt(halfWidth * halfWidth + halfDepth * halfDepth);
+        const float distance = std::sqrt(distanceSquared);
+        if (distance <= boundRadius) return true;
+
+        const glm::vec2 direction = toCenter / distance;
+        const float cosine = glm::clamp(glm::dot(direction, forwardXZ), -1.0f, 1.0f);
+        const float centerAngleDegrees = glm::degrees(std::acos(cosine));
+        const float angularRadiusDegrees = glm::degrees(std::asin(glm::clamp(boundRadius / distance, 0.0f, 1.0f)));
+        const float paddingDegrees = 25.0f;
+        const float visibleHalfAngleDegrees = farTerrainHorizontalHalfFovDegrees(baseSystem) + paddingDegrees;
+        return centerAngleDegrees <= visibleHalfAngleDegrees + angularRadiusDegrees;
+    }
+
+    bool farTerrainConservativeAabbVisible(const BaseSystem& baseSystem,
+                                           int minX,
+                                           int minY,
+                                           int minZ,
+                                           int maxX,
+                                           int maxY,
+                                           int maxZ) {
+        return FrustumCullingSystemLogic::ShouldRenderWorldAabb(
+            baseSystem,
+            glm::vec3(static_cast<float>(minX), static_cast<float>(minY), static_cast<float>(minZ)),
+            glm::vec3(static_cast<float>(maxX), static_cast<float>(maxY), static_cast<float>(maxZ))
+        );
+    }
+
+    glm::vec3 farTerrainColorByName(const WorldContext& world, const std::string& name, const glm::vec3& fallback) {
+        auto it = world.colorLibrary.find(name);
+        if (it != world.colorLibrary.end()) return it->second;
+        return fallback;
+    }
+
+    struct FarTerrainMaterial {
+        const char* prototypeName = "GrassBlockTex";
+        glm::vec3 fallbackColor = glm::vec3(0.35f, 0.62f, 0.22f);
+    };
+
+    FarTerrainMaterial farTerrainMaterialForBiome(const WorldContext& world, int biome) {
+        const ExpanseConfig& cfg = world.expanse;
+        if (biome == 2) {
+            return {
+                "SandBlockDesertTex",
+                farTerrainColorByName(world, cfg.colorSand, glm::vec3(0.72f, 0.62f, 0.38f))
+            };
+        }
+        if (biome == 1) {
+            return {
+                "GrassBlockMeadowTex",
+                farTerrainColorByName(world, cfg.colorGrass, glm::vec3(0.30f, 0.64f, 0.24f))
+            };
+        }
+        if (biome == 3 && cfg.islandRadius > 0.0f) {
+            return {
+                "GrassBlockJungleTex",
+                farTerrainColorByName(world, cfg.colorGrass, glm::vec3(0.20f, 0.56f, 0.20f))
+            };
+        }
+        if (biome == 4 || (biome == 3 && cfg.islandRadius <= 0.0f)) {
+            return {
+                "GrassBlockBareWinterTex",
+                farTerrainColorByName(world, cfg.colorSnow, glm::vec3(0.74f, 0.78f, 0.76f))
+            };
+        }
+        return {
+            "GrassBlockTex",
+            farTerrainColorByName(world, cfg.colorGrass, glm::vec3(0.35f, 0.62f, 0.22f))
+        };
+    }
+
+    FarTerrainMaterial farTerrainMaterialForSample(const WorldContext& world, float x, float z) {
+        return farTerrainMaterialForBiome(world, ExpanseBiomeSystemLogic::ResolveBiome(world, x, z));
+    }
+
+    FarTerrainMaterial farTerrainSideMaterialForBiome(const WorldContext& world, int biome) {
+        const ExpanseConfig& cfg = world.expanse;
+        if (biome == 2) {
+            return {
+                "SandBlockTex",
+                farTerrainColorByName(world, cfg.colorSand, glm::vec3(0.72f, 0.62f, 0.38f))
+            };
+        }
+        return {
+            "DirtBlockTex",
+            farTerrainColorByName(world, cfg.colorSoil, glm::vec3(0.35f, 0.24f, 0.14f))
+        };
+    }
+
+    FarTerrainMaterial farTerrainSideMaterialForSample(const WorldContext& world, float x, float z) {
+        return farTerrainSideMaterialForBiome(world, ExpanseBiomeSystemLogic::ResolveBiome(world, x, z));
+    }
+
+    FarTerrainMaterial farTerrainDeepMaterialForSample(const WorldContext& world) {
+        const ExpanseConfig& cfg = world.expanse;
+        return {
+            "StoneBlockTex",
+            farTerrainColorByName(world, cfg.colorStone, glm::vec3(0.28f, 0.24f, 0.20f))
+        };
+    }
+
+    FarTerrainMaterial farTerrainSeabedMaterialForSample(const WorldContext& world) {
+        const ExpanseConfig& cfg = world.expanse;
+        return {
+            "SandBlockTex",
+            farTerrainColorByName(world, cfg.colorSeabed, glm::vec3(0.66f, 0.57f, 0.34f))
+        };
+    }
+
+    struct FarTerrainHydrologyCell {
+        bool valid = false;
+        bool centerIsLand = false;
+        int centerSurfaceY = 0;
+        float centerX = 0.0f;
+        float centerZ = 0.0f;
+        float radius = 0.0f;
+        int depth = 0;
+    };
+
+    struct FarTerrainHydrologySampler {
+        bool isDepthLevel = false;
+        int waterSurfaceY = 0;
+        bool lakeEnabled = false;
+        int lakeSeed = 9103;
+        int lakeCellSize = 360;
+        float lakeChance = 0.08f;
+        float lakeRadiusMin = 50.0f;
+        float lakeRadiusMax = 150.0f;
+        int lakeDepthMin = 24;
+        int lakeDepthMax = 34;
+        int lakeDepthExtra = 10;
+        int lakeMinAboveSea = 4;
+        int lakeChannelLower = 3;
+        bool pondEnabled = false;
+        int pondSeed = 1337;
+        int pondCellSize = 40;
+        float pondChance = 0.70f;
+        float pondRadiusMin = 10.0f;
+        float pondRadiusMax = 18.0f;
+        int pondDepthMin = 3;
+        int pondDepthMax = 7;
+        int pondMinAboveSea = 1;
+        int pondChannelLower = 3;
+        bool riverEnabled = false;
+        int riverSeed = 2701;
+        float riverScale = 180.0f;
+        float riverWarpScale = 72.0f;
+        float riverWarpStrength = 58.0f;
+        float riverThresholdMin = 0.045f;
+        float riverThresholdMax = 0.085f;
+        int riverDepthMin = 3;
+        int riverDepthMax = 9;
+        int riverMinAboveSea = 2;
+        int riverChannelLowerMin = 3;
+        int riverChannelLowerMax = 5;
+        int riverWaterlineExtraLower = 3;
+        float riverDepthMultiplier = 3.0f;
+        std::unordered_map<uint64_t, FarTerrainHydrologyCell> lakeCache;
+        std::unordered_map<uint64_t, FarTerrainHydrologyCell> pondCache;
+    };
+
+    uint64_t farTerrainHydrologyCellKey(int cellX, int cellZ) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(cellX)) << 32u)
+            | static_cast<uint64_t>(static_cast<uint32_t>(cellZ));
+    }
+
+    FarTerrainHydrologySampler farTerrainCreateHydrologySampler(const BaseSystem& baseSystem,
+                                                                const WorldContext& world) {
+        FarTerrainHydrologySampler sampler{};
+        const ExpanseConfig& cfg = world.expanse;
+        sampler.waterSurfaceY = static_cast<int>(std::floor(cfg.waterSurface));
+        sampler.isDepthLevel = farTerrainGetRegistryString(baseSystem, "level", "the_expanse") == "the_depths";
+        sampler.lakeEnabled = !sampler.isDepthLevel && farTerrainGetRegistryBool(baseSystem, "SurfaceLakeGenerationEnabled", true);
+        sampler.lakeSeed = farTerrainGetRegistryInt(baseSystem, "SurfaceLakeSeed", 9103);
+        sampler.lakeCellSize = std::max(48, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeCellSize", 360));
+        sampler.lakeChance = glm::clamp(farTerrainGetRegistryFloat(baseSystem, "SurfaceLakeChance", 0.08f), 0.0f, 1.0f);
+        sampler.lakeRadiusMin = std::max(6.0f, farTerrainGetRegistryFloat(baseSystem, "SurfaceLakeRadiusMin", 50.0f));
+        sampler.lakeRadiusMax = std::max(sampler.lakeRadiusMin, farTerrainGetRegistryFloat(baseSystem, "SurfaceLakeRadiusMax", 150.0f));
+        sampler.lakeDepthMin = std::max(2, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeDepthMin", 24));
+        sampler.lakeDepthMax = std::max(sampler.lakeDepthMin, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeDepthMax", 34));
+        sampler.lakeDepthExtra = std::max(0, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeDepthExtra", 10));
+        sampler.lakeMinAboveSea = std::max(1, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeMinAboveSea", 4));
+        sampler.lakeChannelLower = std::max(0, farTerrainGetRegistryInt(baseSystem, "SurfaceLakeChannelLower", 3));
+        sampler.pondEnabled = !sampler.isDepthLevel && farTerrainGetRegistryBool(baseSystem, "SurfacePondGenerationEnabled", true);
+        sampler.pondSeed = farTerrainGetRegistryInt(baseSystem, "SurfacePondSeed", 1337);
+        sampler.pondCellSize = std::max(24, farTerrainGetRegistryInt(baseSystem, "SurfacePondCellSize", 40));
+        sampler.pondChance = glm::clamp(farTerrainGetRegistryFloat(baseSystem, "SurfacePondChance", 0.70f), 0.0f, 1.0f);
+        sampler.pondRadiusMin = std::max(2.0f, farTerrainGetRegistryFloat(baseSystem, "SurfacePondRadiusMin", 10.0f));
+        sampler.pondRadiusMax = std::max(sampler.pondRadiusMin, farTerrainGetRegistryFloat(baseSystem, "SurfacePondRadiusMax", 18.0f));
+        sampler.pondDepthMin = std::max(1, farTerrainGetRegistryInt(baseSystem, "SurfacePondDepthMin", 3));
+        sampler.pondDepthMax = std::max(sampler.pondDepthMin, farTerrainGetRegistryInt(baseSystem, "SurfacePondDepthMax", 7));
+        sampler.pondMinAboveSea = std::max(1, farTerrainGetRegistryInt(baseSystem, "SurfacePondMinAboveSea", 1));
+        sampler.pondChannelLower = std::max(0, farTerrainGetRegistryInt(baseSystem, "SurfacePondChannelLower", 3));
+        sampler.riverEnabled = !sampler.isDepthLevel && farTerrainGetRegistryBool(baseSystem, "SurfaceRiverGenerationEnabled", true);
+        sampler.riverSeed = farTerrainGetRegistryInt(baseSystem, "SurfaceRiverSeed", 2701);
+        sampler.riverScale = std::max(32.0f, farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverScale", 180.0f));
+        sampler.riverWarpScale = std::max(16.0f, farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverWarpScale", 72.0f));
+        sampler.riverWarpStrength = std::max(0.0f, farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverWarpStrength", 58.0f));
+        sampler.riverThresholdMin = glm::clamp(farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverThresholdMin", 0.045f), 0.001f, 0.45f);
+        sampler.riverThresholdMax = glm::clamp(
+            farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverThresholdMax", 0.085f),
+            sampler.riverThresholdMin,
+            0.75f
+        );
+        sampler.riverDepthMin = std::max(1, farTerrainGetRegistryInt(baseSystem, "SurfaceRiverDepthMin", 3));
+        sampler.riverDepthMax = std::max(sampler.riverDepthMin, farTerrainGetRegistryInt(baseSystem, "SurfaceRiverDepthMax", 9));
+        sampler.riverMinAboveSea = std::max(1, farTerrainGetRegistryInt(baseSystem, "SurfaceRiverMinAboveSea", 2));
+        sampler.riverChannelLowerMin = std::max(0, farTerrainGetRegistryInt(baseSystem, "SurfaceRiverChannelLowerMin", 3));
+        sampler.riverChannelLowerMax = std::max(
+            sampler.riverChannelLowerMin,
+            farTerrainGetRegistryInt(baseSystem, "SurfaceRiverChannelLowerMax", 5)
+        );
+        sampler.riverWaterlineExtraLower = std::max(0, farTerrainGetRegistryInt(baseSystem, "SurfaceRiverWaterlineExtraLower", 3));
+        sampler.riverDepthMultiplier = std::max(1.0f, farTerrainGetRegistryFloat(baseSystem, "SurfaceRiverDepthMultiplier", 3.0f));
+        return sampler;
+    }
+
+    FarTerrainHydrologyCell& farTerrainLakeCellInfo(FarTerrainHydrologySampler& sampler,
+                                                    const WorldContext& world,
+                                                    int cellX,
+                                                    int cellZ) {
+        const uint64_t key = farTerrainHydrologyCellKey(cellX, cellZ);
+        auto found = sampler.lakeCache.find(key);
+        if (found != sampler.lakeCache.end()) return found->second;
+
+        FarTerrainHydrologyCell info{};
+        if (sampler.lakeEnabled) {
+            const uint32_t seed = farTerrainHash2DInt(cellX + sampler.lakeSeed * 61, cellZ - sampler.lakeSeed * 47);
+            const float chanceRoll = static_cast<float>((seed >> 24u) & 0xffu) / 255.0f;
+            if (chanceRoll <= sampler.lakeChance) {
+                const float offsetX = static_cast<float>(seed & 0xffu) / 255.0f;
+                const float offsetZ = static_cast<float>((seed >> 8u) & 0xffu) / 255.0f;
+                info.centerX = (static_cast<float>(cellX) + offsetX) * static_cast<float>(sampler.lakeCellSize);
+                info.centerZ = (static_cast<float>(cellZ) + offsetZ) * static_cast<float>(sampler.lakeCellSize);
+                const uint32_t radiusSeed = farTerrainHash2DInt(cellX * 139 + sampler.lakeSeed, cellZ * 191 - sampler.lakeSeed);
+                const float radiusT = static_cast<float>(radiusSeed & 0xffu) / 255.0f;
+                info.radius = sampler.lakeRadiusMin + (sampler.lakeRadiusMax - sampler.lakeRadiusMin) * radiusT;
+                const uint32_t depthSeed = farTerrainHash2DInt(cellX * 331 + sampler.lakeSeed * 7, cellZ * 587 - sampler.lakeSeed * 11);
+                const float depthT = static_cast<float>((depthSeed >> 8u) & 0xffu) / 255.0f;
+                info.depth = sampler.lakeDepthMin
+                    + static_cast<int>(std::round((sampler.lakeDepthMax - sampler.lakeDepthMin) * depthT));
+                float centerHeight = 0.0f;
+                info.centerIsLand = ExpanseBiomeSystemLogic::SampleTerrain(world, info.centerX, info.centerZ, centerHeight);
+                info.centerSurfaceY = static_cast<int>(std::floor(centerHeight));
+                info.valid = true;
+            }
+        }
+        return sampler.lakeCache.emplace(key, info).first->second;
+    }
+
+    FarTerrainHydrologyCell& farTerrainPondCellInfo(FarTerrainHydrologySampler& sampler,
+                                                    const WorldContext& world,
+                                                    int cellX,
+                                                    int cellZ) {
+        const uint64_t key = farTerrainHydrologyCellKey(cellX, cellZ);
+        auto found = sampler.pondCache.find(key);
+        if (found != sampler.pondCache.end()) return found->second;
+
+        FarTerrainHydrologyCell info{};
+        if (sampler.pondEnabled) {
+            const uint32_t seed = farTerrainHash2DInt(cellX + sampler.pondSeed * 37, cellZ - sampler.pondSeed * 53);
+            const float chanceRoll = static_cast<float>((seed >> 24u) & 0xffu) / 255.0f;
+            if (chanceRoll <= sampler.pondChance) {
+                const float offsetX = static_cast<float>(seed & 0xffu) / 255.0f;
+                const float offsetZ = static_cast<float>((seed >> 8u) & 0xffu) / 255.0f;
+                info.centerX = (static_cast<float>(cellX) + offsetX) * static_cast<float>(sampler.pondCellSize);
+                info.centerZ = (static_cast<float>(cellZ) + offsetZ) * static_cast<float>(sampler.pondCellSize);
+                const uint32_t radiusSeed = farTerrainHash2DInt(cellX * 131 + sampler.pondSeed, cellZ * 173 - sampler.pondSeed);
+                const float radiusT = static_cast<float>(radiusSeed & 0xffu) / 255.0f;
+                info.radius = sampler.pondRadiusMin + (sampler.pondRadiusMax - sampler.pondRadiusMin) * radiusT;
+                const uint32_t depthSeed = farTerrainHash2DInt(cellX * 313 + sampler.pondSeed * 7, cellZ * 571 - sampler.pondSeed * 11);
+                const float depthT = static_cast<float>((depthSeed >> 8u) & 0xffu) / 255.0f;
+                info.depth = sampler.pondDepthMin
+                    + static_cast<int>(std::round((sampler.pondDepthMax - sampler.pondDepthMin) * depthT));
+                float centerHeight = 0.0f;
+                info.centerIsLand = ExpanseBiomeSystemLogic::SampleTerrain(world, info.centerX, info.centerZ, centerHeight);
+                info.centerSurfaceY = static_cast<int>(std::floor(centerHeight));
+                info.valid = true;
+            }
+        }
+        return sampler.pondCache.emplace(key, info).first->second;
+    }
+
+    int farTerrainHydrologySurfaceY(FarTerrainHydrologySampler& sampler,
+                                    const WorldContext& world,
+                                    float worldX,
+                                    float worldZ,
+                                    bool isLand,
+                                    int rawSurfaceY) {
+        if (!isLand || sampler.isDepthLevel) return rawSurfaceY;
+
+        int surfaceY = rawSurfaceY;
+        const int worldXi = static_cast<int>(std::floor(worldX));
+        const int worldZi = static_cast<int>(std::floor(worldZ));
+        const ExpanseConfig& cfg = world.expanse;
+        const bool isBeach = surfaceY <= sampler.waterSurfaceY + static_cast<int>(cfg.beachHeight);
+
+        bool lakeColumn = false;
+        int lakeWaterY = surfaceY;
+        if (sampler.lakeEnabled
+            && !isBeach
+            && surfaceY >= (sampler.waterSurfaceY + sampler.lakeMinAboveSea)) {
+            const int lakeCellX = farTerrainFloorDiv(worldXi, sampler.lakeCellSize);
+            const int lakeCellZ = farTerrainFloorDiv(worldZi, sampler.lakeCellSize);
+            float bestWeight = 0.0f;
+            const FarTerrainHydrologyCell* bestLake = nullptr;
+            for (int oz = -1; oz <= 1; ++oz) {
+                for (int ox = -1; ox <= 1; ++ox) {
+                    const FarTerrainHydrologyCell& lake = farTerrainLakeCellInfo(sampler, world, lakeCellX + ox, lakeCellZ + oz);
+                    if (!lake.valid || !lake.centerIsLand) continue;
+                    if (lake.centerSurfaceY < (sampler.waterSurfaceY + sampler.lakeMinAboveSea)) continue;
+                    const float dx = worldX - lake.centerX;
+                    const float dz = worldZ - lake.centerZ;
+                    const float dist2 = dx * dx + dz * dz;
+                    const float radius2 = lake.radius * lake.radius;
+                    if (dist2 > radius2) continue;
+                    const float weight = 1.0f - (std::sqrt(dist2) / lake.radius);
+                    if (!bestLake || weight > bestWeight) {
+                        bestWeight = weight;
+                        bestLake = &lake;
+                    }
+                }
+            }
+            if (bestLake) {
+                const int lakeDepthAllowance = bestLake->depth + 6;
+                if (std::abs(surfaceY - bestLake->centerSurfaceY) <= lakeDepthAllowance) {
+                    const float innerT = std::clamp((bestWeight - 0.06f) / 0.94f, 0.0f, 1.0f);
+                    if (innerT > 0.0f) {
+                        lakeWaterY = bestLake->centerSurfaceY - 1 - sampler.lakeChannelLower;
+                        if (lakeWaterY < surfaceY) {
+                            const int lakeDepthHere = std::max(
+                                2,
+                                static_cast<int>(std::round(static_cast<float>(bestLake->depth + sampler.lakeDepthExtra) * innerT * innerT))
+                            );
+                            const int lakeFloorY = lakeWaterY - lakeDepthHere;
+                            if (lakeFloorY < surfaceY && lakeWaterY > sampler.waterSurfaceY) {
+                                surfaceY = lakeFloorY;
+                                lakeColumn = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        bool pondColumn = false;
+        int pondWaterY = surfaceY;
+        if (sampler.pondEnabled
+            && !lakeColumn
+            && surfaceY >= (sampler.waterSurfaceY + sampler.pondMinAboveSea)) {
+            const int pondCellX = farTerrainFloorDiv(worldXi, sampler.pondCellSize);
+            const int pondCellZ = farTerrainFloorDiv(worldZi, sampler.pondCellSize);
+            float bestWeight = 0.0f;
+            const FarTerrainHydrologyCell* bestPond = nullptr;
+            for (int oz = -1; oz <= 1; ++oz) {
+                for (int ox = -1; ox <= 1; ++ox) {
+                    const FarTerrainHydrologyCell& pond = farTerrainPondCellInfo(sampler, world, pondCellX + ox, pondCellZ + oz);
+                    if (!pond.valid || !pond.centerIsLand) continue;
+                    if (pond.centerSurfaceY < (sampler.waterSurfaceY + sampler.pondMinAboveSea)) continue;
+                    const float dx = worldX - pond.centerX;
+                    const float dz = worldZ - pond.centerZ;
+                    const float dist2 = dx * dx + dz * dz;
+                    const float radius2 = pond.radius * pond.radius;
+                    if (dist2 > radius2) continue;
+                    const float weight = 1.0f - (std::sqrt(dist2) / pond.radius);
+                    if (!bestPond || weight > bestWeight) {
+                        bestWeight = weight;
+                        bestPond = &pond;
+                    }
+                }
+            }
+            if (bestPond) {
+                const int pondDepthAllowance = bestPond->depth + 3;
+                if (std::abs(surfaceY - bestPond->centerSurfaceY) <= pondDepthAllowance) {
+                    const float innerT = std::clamp((bestWeight - 0.12f) / 0.88f, 0.0f, 1.0f);
+                    if (innerT > 0.0f) {
+                        pondWaterY = bestPond->centerSurfaceY - 1 - sampler.pondChannelLower;
+                        if (pondWaterY < surfaceY) {
+                            const int pondDepthHere = std::max(
+                                1,
+                                static_cast<int>(std::round(static_cast<float>(bestPond->depth) * innerT * innerT))
+                            );
+                            const int pondFloorY = pondWaterY - pondDepthHere;
+                            if (pondFloorY < surfaceY && pondWaterY > sampler.waterSurfaceY) {
+                                surfaceY = pondFloorY;
+                                pondColumn = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const bool basinColumn = lakeColumn || pondColumn;
+        if (sampler.riverEnabled
+            && !basinColumn
+            && surfaceY >= (sampler.waterSurfaceY + sampler.riverMinAboveSea)) {
+            const float warpSampleX = worldX / sampler.riverWarpScale;
+            const float warpSampleZ = worldZ / sampler.riverWarpScale;
+            const float warpNoiseX = farTerrainFbmValueNoise2D(sampler.riverSeed * 13 + 7, warpSampleX, warpSampleZ, 3) * 2.0f - 1.0f;
+            const float warpNoiseZ = farTerrainFbmValueNoise2D(sampler.riverSeed * 17 - 5, warpSampleX + 19.4f, warpSampleZ - 11.2f, 3) * 2.0f - 1.0f;
+            const float riverSampleX = (worldX + warpNoiseX * sampler.riverWarpStrength) / sampler.riverScale;
+            const float riverSampleZ = (worldZ + warpNoiseZ * sampler.riverWarpStrength) / sampler.riverScale;
+            const float primary = farTerrainFbmValueNoise2D(sampler.riverSeed, riverSampleX, riverSampleZ, 4);
+            const float ridge = std::abs(primary * 2.0f - 1.0f);
+            const float widthNoise = farTerrainFbmValueNoise2D(
+                sampler.riverSeed * 23 + 101,
+                riverSampleX * 0.65f + 3.7f,
+                riverSampleZ * 0.65f - 2.1f,
+                2
+            );
+            const float ridgeThreshold = sampler.riverThresholdMin
+                + (sampler.riverThresholdMax - sampler.riverThresholdMin) * widthNoise;
+            if (ridge < ridgeThreshold) {
+                const float innerT = std::clamp(1.0f - (ridge / ridgeThreshold), 0.0f, 1.0f);
+                const float depthNoise = farTerrainFbmValueNoise2D(
+                    sampler.riverSeed * 31 + 29,
+                    riverSampleX * 0.8f - 4.2f,
+                    riverSampleZ * 0.8f + 5.3f,
+                    2
+                );
+                const int channelLower = sampler.riverChannelLowerMin
+                    + static_cast<int>(std::round(
+                        static_cast<float>(sampler.riverChannelLowerMax - sampler.riverChannelLowerMin) * depthNoise
+                    ));
+                const int baseRiverWaterY = surfaceY - channelLower;
+                if (baseRiverWaterY > sampler.waterSurfaceY) {
+                    const int depthBase = sampler.riverDepthMin
+                        + static_cast<int>(std::round((sampler.riverDepthMax - sampler.riverDepthMin) * depthNoise));
+                    const int depthBaseBoosted = std::max(
+                        1,
+                        static_cast<int>(std::round(static_cast<float>(depthBase) * sampler.riverDepthMultiplier))
+                    );
+                    const int depthHere = std::max(
+                        2,
+                        static_cast<int>(std::round(static_cast<float>(depthBaseBoosted) * innerT * innerT))
+                    );
+                    const int baseRiverFloorY = baseRiverWaterY - depthHere;
+                    const int riverWaterY = std::max(
+                        baseRiverFloorY + 2,
+                        baseRiverWaterY - sampler.riverWaterlineExtraLower
+                    );
+                    if (riverWaterY > sampler.waterSurfaceY && baseRiverFloorY < surfaceY) {
+                        surfaceY = baseRiverFloorY;
+                    }
+                }
+            }
+        }
+
+        return surfaceY;
+    }
+
+    const Entity* farTerrainFindPrototypeByName(const char* name, const std::vector<Entity>& prototypes) {
+        if (!name || name[0] == '\0') return nullptr;
+        for (const Entity& proto : prototypes) {
+            if (proto.name == name) return &proto;
+        }
+        return nullptr;
+    }
+
+    int farTerrainMaterialTile(const WorldContext& world,
+                               const std::vector<Entity>& prototypes,
+                               const char* prototypeName,
+                               int faceType) {
+        const Entity* proto = farTerrainFindPrototypeByName(prototypeName, prototypes);
+        if (!proto) proto = farTerrainFindPrototypeByName("GrassBlockTex", prototypes);
+        if (!proto) proto = farTerrainFindPrototypeByName("Block", prototypes);
+        if (!proto) return -1;
+        return RenderInitSystemLogic::FaceTileIndexFor(&world, *proto, faceType);
+    }
+
+    struct FarTerrainMaterialTileCacheKey {
+        const char* prototypeName = nullptr;
+        int faceType = 0;
+
+        bool operator==(const FarTerrainMaterialTileCacheKey& other) const noexcept {
+            return prototypeName == other.prototypeName && faceType == other.faceType;
+        }
+    };
+
+    struct FarTerrainMaterialTileCacheKeyHash {
+        size_t operator()(const FarTerrainMaterialTileCacheKey& key) const noexcept {
+            size_t h = std::hash<const void*>()(static_cast<const void*>(key.prototypeName));
+            h ^= std::hash<int>()(key.faceType) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            return h;
+        }
+    };
+
+    struct FarTerrainMaterialTileCache {
+        const WorldContext& world;
+        const std::vector<Entity>& prototypes;
+        std::unordered_map<FarTerrainMaterialTileCacheKey, int, FarTerrainMaterialTileCacheKeyHash> tileIndices;
+
+        FarTerrainMaterialTileCache(const WorldContext& worldRef, const std::vector<Entity>& prototypesRef)
+            : world(worldRef), prototypes(prototypesRef) {
+            tileIndices.reserve(32);
+        }
+
+        int get(const char* prototypeName, int faceType) {
+            const char* safeName = prototypeName ? prototypeName : "";
+            const FarTerrainMaterialTileCacheKey key{safeName, faceType};
+            auto found = tileIndices.find(key);
+            if (found != tileIndices.end()) return found->second;
+            const int tileIndex = farTerrainMaterialTile(world, prototypes, safeName, faceType);
+            tileIndices.emplace(key, tileIndex);
+            return tileIndex;
+        }
+    };
+
+    void farTerrainClearFaceSet(std::array<std::vector<FaceInstanceRenderData>, 6>& faces, size_t& visibleFaceCount) {
+        for (auto& batch : faces) batch.clear();
+        visibleFaceCount = 0;
+    }
+
+    void farTerrainSyncVisibleFaceCount(FarTerrainClipmapContext& ctx) {
+        ctx.visibleFaceCount = ctx.handoffVisibleFaceCount + ctx.bodyVisibleFaceCount;
+    }
+
+    void farTerrainClearAllFaces(FarTerrainClipmapContext& ctx) {
+        farTerrainClearFaceSet(ctx.handoffFaces, ctx.handoffVisibleFaceCount);
+        farTerrainClearFaceSet(ctx.bodyFaces, ctx.bodyVisibleFaceCount);
+        farTerrainSyncVisibleFaceCount(ctx);
+        ctx.lastLandCellCount = 0;
+        ctx.lastHandoffCellCount = 0;
+        ctx.lastBodyCellCount = 0;
+        ctx.lastSuppressedCellCount = 0;
+        ctx.lastFullRebuild = false;
+        ctx.lastHandoffRefresh = false;
+        ctx.boundsDebugEnabled = false;
+        ctx.visibleRingCount = 0;
+        ctx.lodCellCounts.fill(0);
+        ctx.lodFaceCounts.fill(0);
+    }
+
+    void farTerrainDestroyRenderBuffer(BaseSystem& baseSystem,
+                                       ChunkRenderBuffers& renderBuffers,
+                                       bool& renderBuffersValid,
+                                       bool& renderBuffersDirty) {
+        if (baseSystem.renderBackend && renderBuffersValid) {
+            RenderInitSystemLogic::DestroyChunkRenderBuffers(renderBuffers, *baseSystem.renderBackend);
+        }
+        renderBuffers = ChunkRenderBuffers{};
+        renderBuffersValid = false;
+        renderBuffersDirty = false;
+    }
+
+    void farTerrainDestroyRenderBuffers(BaseSystem& baseSystem, FarTerrainClipmapContext& ctx) {
+        auto destroyRenderClusters = [&](std::vector<VoxelRenderCluster>& clusters) {
+            if (baseSystem.renderBackend) {
+                for (VoxelRenderCluster& cluster : clusters) {
+                    RenderInitSystemLogic::DestroyChunkRenderBuffers(cluster.buffers, *baseSystem.renderBackend);
+                }
+            }
+            clusters.clear();
+        };
+        destroyRenderClusters(ctx.handoffRenderClusters);
+        destroyRenderClusters(ctx.bodyRenderClusters);
+        farTerrainDestroyRenderBuffer(
+            baseSystem,
+            ctx.handoffRenderBuffers,
+            ctx.handoffRenderBuffersValid,
+            ctx.handoffRenderBuffersDirty
+        );
+        farTerrainDestroyRenderBuffer(
+            baseSystem,
+            ctx.bodyRenderBuffers,
+            ctx.bodyRenderBuffersValid,
+            ctx.bodyRenderBuffersDirty
+        );
+    }
+
+    glm::vec3 farTerrainFaceHalfExtents(int faceType, const glm::vec2& scale) {
+        switch (faceType) {
+            case 0:
+            case 1:
+                return glm::vec3(0.5f, scale.y * 0.5f, scale.x * 0.5f);
+            case 2:
+            case 3:
+                return glm::vec3(scale.x * 0.5f, 0.5f, scale.y * 0.5f);
+            case 4:
+            case 5:
+                return glm::vec3(scale.x * 0.5f, scale.y * 0.5f, 0.5f);
+            default:
+                return glm::vec3(0.5f);
+        }
+    }
+
+    struct FarTerrainRenderClusterCoord {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+
+        bool operator==(const FarTerrainRenderClusterCoord& other) const noexcept {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+
+    struct FarTerrainRenderClusterCoordHash {
+        size_t operator()(const FarTerrainRenderClusterCoord& coord) const noexcept {
+            size_t h = std::hash<int>()(coord.x);
+            h ^= std::hash<int>()(coord.y) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<int>()(coord.z) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            return h;
+        }
+    };
+
+    struct FarTerrainClusterPreparedMesh {
+        PreparedVoxelSectionMesh mesh;
+        glm::vec3 minBounds = glm::vec3(std::numeric_limits<float>::max());
+        glm::vec3 maxBounds = glm::vec3(-std::numeric_limits<float>::max());
+        bool hasBounds = false;
+    };
+
+    void farTerrainExpandClusterBounds(FarTerrainClusterPreparedMesh& cluster,
+                                       const glm::vec3& minBounds,
+                                       const glm::vec3& maxBounds) {
+        if (!cluster.hasBounds) {
+            cluster.minBounds = minBounds;
+            cluster.maxBounds = maxBounds;
+            cluster.hasBounds = true;
+            return;
+        }
+        cluster.minBounds = glm::min(cluster.minBounds, minBounds);
+        cluster.maxBounds = glm::max(cluster.maxBounds, maxBounds);
+    }
+
+    FarTerrainRenderClusterCoord farTerrainClusterCoordForPosition(const glm::vec3& position, int clusterSizeBlocks) {
+        const float invCluster = 1.0f / static_cast<float>(std::max(1, clusterSizeBlocks));
+        return {
+            static_cast<int>(std::floor(position.x * invCluster)),
+            static_cast<int>(std::floor(position.y * invCluster)),
+            static_cast<int>(std::floor(position.z * invCluster))
+        };
+    }
+
+    void farTerrainUploadRenderClusterSet(BaseSystem& baseSystem,
+                                          const std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                          int clusterSizeBlocks,
+                                          std::vector<VoxelRenderCluster>& renderClusters,
+                                          ChunkRenderBuffers& legacyRenderBuffers,
+                                          bool& renderBuffersValid,
+                                          bool& renderBuffersDirty,
+                                          FarTerrainBuildPerfStats* perfStats = nullptr) {
+        if (!renderBuffersDirty || !baseSystem.renderer || !baseSystem.renderBackend) return;
+
+        if (renderBuffersValid) {
+            RenderInitSystemLogic::DestroyChunkRenderBuffers(legacyRenderBuffers, *baseSystem.renderBackend);
+            legacyRenderBuffers = ChunkRenderBuffers{};
+            renderBuffersValid = false;
+        }
+        for (VoxelRenderCluster& cluster : renderClusters) {
+            RenderInitSystemLogic::DestroyChunkRenderBuffers(cluster.buffers, *baseSystem.renderBackend);
+        }
+        renderClusters.clear();
+
+        std::unordered_map<
+            FarTerrainRenderClusterCoord,
+            FarTerrainClusterPreparedMesh,
+            FarTerrainRenderClusterCoordHash
+        > clusterMeshes;
+        clusterMeshes.reserve(64);
+        const auto prepStart = std::chrono::steady_clock::now();
+
+        auto getCluster = [&](const FarTerrainRenderClusterCoord& coord) -> FarTerrainClusterPreparedMesh& {
+            FarTerrainClusterPreparedMesh& cluster = clusterMeshes[coord];
+            cluster.mesh.usesTexturedFaceBuffers = true;
+            return cluster;
+        };
+
+        for (int faceType = 0; faceType < 6; ++faceType) {
+            for (const FaceInstanceRenderData& face : faces[static_cast<size_t>(faceType)]) {
+                const FarTerrainRenderClusterCoord coord =
+                    farTerrainClusterCoordForPosition(face.position, clusterSizeBlocks);
+                FarTerrainClusterPreparedMesh& cluster = getCluster(coord);
+                cluster.mesh.opaqueFaces[static_cast<size_t>(faceType)].push_back(face);
+                const glm::vec3 halfExtents = farTerrainFaceHalfExtents(faceType, face.scale);
+                farTerrainExpandClusterBounds(cluster, face.position - halfExtents, face.position + halfExtents);
+            }
+        }
+        if (perfStats) {
+            perfStats->clusterPrepMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prepStart
+            ).count();
+        }
+
+        renderClusters.reserve(clusterMeshes.size());
+        const auto uploadStart = std::chrono::steady_clock::now();
+        for (auto& [coord, clusterMesh] : clusterMeshes) {
+            (void)coord;
+            if (!clusterMesh.hasBounds) continue;
+            VoxelRenderCluster cluster{};
+            cluster.minBounds = clusterMesh.minBounds;
+            cluster.maxBounds = clusterMesh.maxBounds;
+            if (!VoxelMeshUploadSystemLogic::UploadPreparedVoxelSectionMesh(
+                    clusterMesh.mesh,
+                    cluster.buffers,
+                    *baseSystem.renderer,
+                    *baseSystem.renderBackend)) {
+                RenderInitSystemLogic::DestroyChunkRenderBuffers(cluster.buffers, *baseSystem.renderBackend);
+                continue;
+            }
+            renderClusters.push_back(std::move(cluster));
+        }
+        if (perfStats) {
+            perfStats->clusterUploadMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - uploadStart
+            ).count();
+        }
+
+        renderBuffersValid = !renderClusters.empty();
+        renderBuffersDirty = false;
+    }
+
+    void farTerrainUploadRenderBuffers(BaseSystem& baseSystem,
+                                       FarTerrainClipmapContext& ctx,
+                                       FarTerrainBuildPerfStats* perfStats = nullptr) {
+        const int handoffClusterSizeBlocks = std::max(32, ctx.baseCellSize * 32);
+        const int bodyClusterSizeBlocks = std::max(64, ctx.baseCellSize * 64);
+        farTerrainUploadRenderClusterSet(
+            baseSystem,
+            ctx.handoffFaces,
+            handoffClusterSizeBlocks,
+            ctx.handoffRenderClusters,
+            ctx.handoffRenderBuffers,
+            ctx.handoffRenderBuffersValid,
+            ctx.handoffRenderBuffersDirty,
+            perfStats
+        );
+        farTerrainUploadRenderClusterSet(
+            baseSystem,
+            ctx.bodyFaces,
+            bodyClusterSizeBlocks,
+            ctx.bodyRenderClusters,
+            ctx.bodyRenderBuffers,
+            ctx.bodyRenderBuffersValid,
+            ctx.bodyRenderBuffersDirty,
+            perfStats
+        );
+    }
+
+    int farTerrainFloorToMultiple(float value, int step) {
+        const float scaled = value / static_cast<float>(std::max(1, step));
+        return static_cast<int>(std::floor(scaled)) * std::max(1, step);
+    }
+
+    int farTerrainFloorDivInt(int value, int divisor) {
+        if (divisor <= 0) return 0;
+        if (value >= 0) return value / divisor;
+        return -(((-value) + divisor - 1) / divisor);
+    }
+
+    uint64_t farTerrainCellKey(int x, int z) {
+        const uint32_t ux = static_cast<uint32_t>(x);
+        const uint32_t uz = static_cast<uint32_t>(z);
+        return (static_cast<uint64_t>(ux) << 32u) | static_cast<uint64_t>(uz);
+    }
+
+    uint64_t farTerrainHashMix(uint64_t hash, int value) {
+        hash ^= static_cast<uint64_t>(static_cast<uint32_t>(value)) + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        return hash;
+    }
+
+    uint64_t farTerrainCellResolveCacheKey(int x, int z, int size) {
+        uint64_t hash = 1469598103934665603ull;
+        hash = farTerrainHashMix(hash, x);
+        hash = farTerrainHashMix(hash, z);
+        hash = farTerrainHashMix(hash, size);
+        return hash;
+    }
+
+    const FarTerrainCachedCell* farTerrainFindCellAt(const std::vector<FarTerrainCachedCell>& cells,
+                                                     const std::unordered_map<uint64_t, size_t>& cellIndex,
+                                                     int x,
+                                                     int z) {
+        auto it = cellIndex.find(farTerrainCellKey(x, z));
+        if (it == cellIndex.end()) return nullptr;
+        return &cells[it->second];
+    }
+
+    bool farTerrainOccludesTopCorner(const FarTerrainCachedCell* neighbor, int topY) {
+        return neighbor && neighbor->topY >= topY;
+    }
+
+    float farTerrainCornerAo(bool sideA, bool sideB, bool corner) {
+        if (sideA && sideB) return 0.56f;
+        float ao = 1.0f;
+        if (sideA) ao -= 0.16f;
+        if (sideB) ao -= 0.16f;
+        if (corner) ao -= 0.10f;
+        return glm::clamp(ao, 0.58f, 1.0f);
+    }
+
+    glm::vec4 farTerrainTopAo(const FarTerrainCachedCell& cell,
+                              const std::vector<FarTerrainCachedCell>& cells,
+                              const std::unordered_map<uint64_t, size_t>& cellIndex) {
+        const int s = cell.size;
+        const FarTerrainCachedCell* west = farTerrainFindCellAt(cells, cellIndex, cell.x - s, cell.z);
+        const FarTerrainCachedCell* east = farTerrainFindCellAt(cells, cellIndex, cell.x + s, cell.z);
+        const FarTerrainCachedCell* north = farTerrainFindCellAt(cells, cellIndex, cell.x, cell.z - s);
+        const FarTerrainCachedCell* south = farTerrainFindCellAt(cells, cellIndex, cell.x, cell.z + s);
+        const FarTerrainCachedCell* northWest = farTerrainFindCellAt(cells, cellIndex, cell.x - s, cell.z - s);
+        const FarTerrainCachedCell* northEast = farTerrainFindCellAt(cells, cellIndex, cell.x + s, cell.z - s);
+        const FarTerrainCachedCell* southWest = farTerrainFindCellAt(cells, cellIndex, cell.x - s, cell.z + s);
+        const FarTerrainCachedCell* southEast = farTerrainFindCellAt(cells, cellIndex, cell.x + s, cell.z + s);
+
+        const bool w = farTerrainOccludesTopCorner(west, cell.topY);
+        const bool e = farTerrainOccludesTopCorner(east, cell.topY);
+        const bool n = farTerrainOccludesTopCorner(north, cell.topY);
+        const bool s0 = farTerrainOccludesTopCorner(south, cell.topY);
+        return glm::vec4(
+            farTerrainCornerAo(w, n, farTerrainOccludesTopCorner(northWest, cell.topY)),
+            farTerrainCornerAo(e, n, farTerrainOccludesTopCorner(northEast, cell.topY)),
+            farTerrainCornerAo(e, s0, farTerrainOccludesTopCorner(southEast, cell.topY)),
+            farTerrainCornerAo(w, s0, farTerrainOccludesTopCorner(southWest, cell.topY))
+        );
+    }
+
+    glm::vec4 farTerrainVerticalAo(int heightSpan, bool upperContact) {
+        const float topAo = upperContact ? 0.78f : 0.92f;
+        const float bottomAo = heightSpan > 6 ? 0.64f : 0.74f;
+        return glm::vec4(topAo, topAo, bottomAo, bottomAo);
+    }
+
+    glm::vec3 farTerrainLitColor(const FarTerrainCachedCell& cell, int faceType, bool textured) {
+        float light = 1.0f;
+        if (faceType == 0) {
+            light = 0.72f;
+        } else if (faceType == 1) {
+            light = 0.58f;
+        } else if (faceType == 4) {
+            light = 0.66f;
+        } else if (faceType == 5) {
+            light = 0.62f;
+        }
+        if (textured) {
+            return glm::vec3(light);
+        }
+        return cell.fallbackColor * light;
+    }
+
+    glm::vec2 farTerrainTileUvScale(const glm::vec2& faceScale) {
+        // Face scale is measured in world blocks. Repeat the atlas tile once per
+        // block so LOD proxy cells keep pixel density instead of stretching.
+        return glm::max(faceScale, glm::vec2(1.0f));
+    }
+
+    uint32_t farTerrainPackColor(const glm::vec3& color) {
+        const float rf = std::clamp(static_cast<float>(std::round(color.r * 255.0f)), 0.0f, 255.0f);
+        const float gf = std::clamp(static_cast<float>(std::round(color.g * 255.0f)), 0.0f, 255.0f);
+        const float bf = std::clamp(static_cast<float>(std::round(color.b * 255.0f)), 0.0f, 255.0f);
+        const uint32_t r = static_cast<uint32_t>(rf);
+        const uint32_t g = static_cast<uint32_t>(gf);
+        const uint32_t b = static_cast<uint32_t>(bf);
+        return (r << 16u) | (g << 8u) | b;
+    }
+
+    struct FarTerrainTopCellInfo {
+        int gridX = 0;
+        int gridZ = 0;
+        int topY = 0;
+        int tileIndex = -1;
+        uint32_t packedColor = 0;
+        glm::vec3 color = glm::vec3(1.0f);
+        glm::vec4 ao = glm::vec4(1.0f);
+    };
+
+    bool farTerrainTopCellsCompatible(const FarTerrainTopCellInfo& a,
+                                      const FarTerrainTopCellInfo& b) {
+        return a.topY == b.topY
+            && a.tileIndex == b.tileIndex
+            && a.packedColor == b.packedColor;
+    }
+
+    bool farTerrainAppendGreedyTopQuad(FaceInstanceRenderData& face,
+                                       const glm::ivec3& worldMin,
+                                       int spanXCells,
+                                       int spanZCells,
+                                       int cellSize) {
+        if (spanXCells <= 0 || spanZCells <= 0 || cellSize <= 0) return false;
+
+        const int spanXBlocks = spanXCells * cellSize;
+        const int spanZBlocks = spanZCells * cellSize;
+        face.position = glm::vec3(
+            static_cast<float>(worldMin.x) + 0.5f * static_cast<float>(spanXBlocks - 1),
+            static_cast<float>(worldMin.y) + 0.5f,
+            static_cast<float>(worldMin.z) + 0.5f * static_cast<float>(spanZBlocks - 1)
+        );
+        face.scale = glm::vec2(static_cast<float>(spanXBlocks), static_cast<float>(spanZBlocks));
+        face.uvScale = farTerrainTileUvScale(face.scale);
+        face.alpha = 1.0f;
+        return true;
+    }
+
+    void farTerrainAppendGreedyTopFaces(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                        size_t& visibleFaceCount,
+                                        FarTerrainMaterialTileCache& tileCache,
+                                        const std::vector<FarTerrainCachedCell>& cells,
+                                        const std::unordered_map<uint64_t, size_t>& cellIndex,
+                                        int cellSize,
+                                        FarTerrainBuildPerfStats* perfStats = nullptr) {
+        if (cells.empty() || cellSize <= 0) return;
+
+        int minCellX = std::numeric_limits<int>::max();
+        int maxCellX = std::numeric_limits<int>::min();
+        int minCellZ = std::numeric_limits<int>::max();
+        int maxCellZ = std::numeric_limits<int>::min();
+        std::vector<FarTerrainTopCellInfo> topCells;
+        topCells.reserve(cells.size());
+        std::unordered_map<uint64_t, size_t> topCellIndex;
+        topCellIndex.reserve(cells.size() * 2);
+
+        for (const FarTerrainCachedCell& cell : cells) {
+            const int gridX = farTerrainFloorDivInt(cell.x, cellSize);
+            const int gridZ = farTerrainFloorDivInt(cell.z, cellSize);
+            minCellX = std::min(minCellX, gridX);
+            maxCellX = std::max(maxCellX, gridX);
+            minCellZ = std::min(minCellZ, gridZ);
+            maxCellZ = std::max(maxCellZ, gridZ);
+
+            const int tileIndex = tileCache.get(cell.prototypeName, 2);
+            const glm::vec3 color = farTerrainLitColor(cell, 2, tileIndex >= 0);
+            const size_t index = topCells.size();
+            topCells.push_back({
+                gridX,
+                gridZ,
+                cell.topY,
+                tileIndex,
+                farTerrainPackColor(color),
+                color,
+                farTerrainTopAo(cell, cells, cellIndex)
+            });
+            topCellIndex.emplace(farTerrainCellKey(gridX, gridZ), index);
+        }
+
+        const auto greedyStart = std::chrono::steady_clock::now();
+        std::vector<uint8_t> consumed(topCells.size(), 0u);
+
+        for (int cellZ = minCellZ; cellZ <= maxCellZ; ++cellZ) {
+            for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+                auto startIt = topCellIndex.find(farTerrainCellKey(cellX, cellZ));
+                if (startIt == topCellIndex.end()) continue;
+                const size_t startIndex = startIt->second;
+                if (consumed[startIndex]) continue;
+
+                const FarTerrainTopCellInfo& startCell = topCells[startIndex];
+                int spanXCells = 1;
+                while (true) {
+                    const int nextX = cellX + spanXCells;
+                    auto nextIt = topCellIndex.find(farTerrainCellKey(nextX, cellZ));
+                    if (nextIt == topCellIndex.end()) break;
+                    const size_t nextIndex = nextIt->second;
+                    if (consumed[nextIndex]
+                        || !farTerrainTopCellsCompatible(startCell, topCells[nextIndex])) {
+                        break;
+                    }
+                    spanXCells += 1;
+                }
+
+                int spanZCells = 1;
+                while (true) {
+                    const int nextZ = cellZ + spanZCells;
+                    bool rowMatches = true;
+                    for (int dx = 0; dx < spanXCells; ++dx) {
+                        auto rowIt = topCellIndex.find(farTerrainCellKey(cellX + dx, nextZ));
+                        if (rowIt == topCellIndex.end()) {
+                            rowMatches = false;
+                            break;
+                        }
+                        const size_t rowIndex = rowIt->second;
+                        if (consumed[rowIndex]
+                            || !farTerrainTopCellsCompatible(startCell, topCells[rowIndex])) {
+                            rowMatches = false;
+                            break;
+                        }
+                    }
+                    if (!rowMatches) break;
+                    spanZCells += 1;
+                }
+
+                for (int dz = 0; dz < spanZCells; ++dz) {
+                    for (int dx = 0; dx < spanXCells; ++dx) {
+                        auto markIt = topCellIndex.find(farTerrainCellKey(cellX + dx, cellZ + dz));
+                        if (markIt != topCellIndex.end()) {
+                            consumed[markIt->second] = 1u;
+                        }
+                    }
+                }
+
+                FaceInstanceRenderData face{};
+                face.tileIndex = startCell.tileIndex;
+                face.color = startCell.color;
+                face.ao = startCell.ao;
+                const glm::ivec3 worldMin(
+                    cellX * cellSize,
+                    startCell.topY,
+                    cellZ * cellSize
+                );
+                if (!farTerrainAppendGreedyTopQuad(
+                        face,
+                        worldMin,
+                        spanXCells,
+                        spanZCells,
+                        cellSize)) {
+                    continue;
+                }
+                faces[2].push_back(face);
+                visibleFaceCount += 1;
+            }
+        }
+        if (perfStats) {
+            perfStats->topGreedyMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - greedyStart
+            ).count();
+        }
+    }
+
+    glm::vec3 farTerrainBoundsDebugColor(int ring) {
+        static const glm::vec3 kColors[] = {
+            glm::vec3(1.00f, 0.12f, 0.10f),
+            glm::vec3(1.00f, 0.58f, 0.05f),
+            glm::vec3(1.00f, 0.92f, 0.08f),
+            glm::vec3(0.20f, 1.00f, 0.18f),
+            glm::vec3(0.10f, 0.95f, 0.95f),
+            glm::vec3(0.16f, 0.42f, 1.00f),
+            glm::vec3(0.72f, 0.18f, 1.00f),
+            glm::vec3(1.00f, 0.16f, 0.72f),
+            glm::vec3(0.95f, 0.95f, 0.95f),
+            glm::vec3(0.15f, 0.15f, 0.15f)
+        };
+        constexpr int kColorCount = static_cast<int>(sizeof(kColors) / sizeof(kColors[0]));
+        return kColors[static_cast<size_t>(std::clamp(ring, 0, kColorCount - 1))];
+    }
+
+    void farTerrainAppendBoundsDebugFace(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                         size_t& visibleFaceCount,
+                                         int faceType,
+                                         const glm::vec3& position,
+                                         const glm::vec2& scale,
+                                         const glm::vec3& color) {
+        FaceInstanceRenderData face{};
+        face.position = position;
+        face.tileIndex = -1;
+        face.color = color;
+        face.alpha = 0.88f;
+        face.ao = glm::vec4(1.0f);
+        face.scale = glm::max(scale, glm::vec2(0.05f));
+        face.uvScale = glm::vec2(1.0f);
+        faces[static_cast<size_t>(faceType)].push_back(face);
+        visibleFaceCount += 1;
+    }
+
+    struct FarTerrainDebugLineKey {
+        int ring = 0;
+        int topY = 0;
+        int fixedHalf = 0;
+
+        bool operator==(const FarTerrainDebugLineKey& other) const {
+            return ring == other.ring && topY == other.topY && fixedHalf == other.fixedHalf;
+        }
+    };
+
+    struct FarTerrainDebugLineKeyHash {
+        size_t operator()(const FarTerrainDebugLineKey& key) const {
+            size_t h = static_cast<size_t>(key.ring);
+            h = (h * 1315423911u) ^ static_cast<size_t>(key.topY * 92821);
+            h = (h * 2654435761u) ^ static_cast<size_t>(key.fixedHalf);
+            return h;
+        }
+    };
+
+    bool farTerrainSameDebugPlaneNeighbor(const FarTerrainCachedCell* neighbor, const FarTerrainCachedCell& cell) {
+        return neighbor
+            && neighbor->topY == cell.topY
+            && neighbor->lodRing == cell.lodRing
+            && neighbor->size == cell.size;
+    }
+
+    void farTerrainAppendMergedBoundsDebugRuns(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                               size_t& visibleFaceCount,
+                                               const std::vector<FarTerrainCachedCell>& cells,
+                                               const std::unordered_map<uint64_t, size_t>& cellIndex) {
+        std::unordered_map<FarTerrainDebugLineKey, std::vector<std::pair<int, int>>, FarTerrainDebugLineKeyHash> xRuns;
+        std::unordered_map<FarTerrainDebugLineKey, std::vector<std::pair<int, int>>, FarTerrainDebugLineKeyHash> zRuns;
+
+        for (const FarTerrainCachedCell& cell : cells) {
+            const int x0 = cell.x * 2 - 1;
+            const int x1 = (cell.x + cell.size) * 2 - 1;
+            const int z0 = cell.z * 2 - 1;
+            const int z1 = (cell.z + cell.size) * 2 - 1;
+
+            xRuns[{cell.lodRing, cell.topY, z0}].push_back({x0, x1});
+            zRuns[{cell.lodRing, cell.topY, x0}].push_back({z0, z1});
+
+            const FarTerrainCachedCell* east = farTerrainFindCellAt(cells, cellIndex, cell.x + cell.size, cell.z);
+            if (!farTerrainSameDebugPlaneNeighbor(east, cell)) {
+                zRuns[{cell.lodRing, cell.topY, x1}].push_back({z0, z1});
+            }
+
+            const FarTerrainCachedCell* south = farTerrainFindCellAt(cells, cellIndex, cell.x, cell.z + cell.size);
+            if (!farTerrainSameDebugPlaneNeighbor(south, cell)) {
+                xRuns[{cell.lodRing, cell.topY, z1}].push_back({x0, x1});
+            }
+        }
+
+        auto emitMergedRuns = [&](const auto& runMap, bool alongX) {
+            for (const auto& entry : runMap) {
+                const FarTerrainDebugLineKey& key = entry.first;
+                std::vector<std::pair<int, int>> intervals = entry.second;
+                if (intervals.empty()) continue;
+                std::sort(intervals.begin(), intervals.end());
+                std::vector<std::pair<int, int>> merged;
+                merged.reserve(intervals.size());
+                for (const auto& interval : intervals) {
+                    if (merged.empty() || interval.first > merged.back().second) {
+                        merged.push_back(interval);
+                    } else {
+                        merged.back().second = std::max(merged.back().second, interval.second);
+                    }
+                }
+
+                const glm::vec3 color = farTerrainBoundsDebugColor(key.ring);
+                for (const auto& interval : merged) {
+                    const float start = static_cast<float>(interval.first) * 0.5f;
+                    const float end = static_cast<float>(interval.second) * 0.5f;
+                    const float fixed = static_cast<float>(key.fixedHalf) * 0.5f;
+                    const float y = static_cast<float>(key.topY) + 1.03f;
+                    const float length = std::max(0.05f, end - start);
+                    const float thickness = glm::clamp(length * 0.0125f, 0.05f, 0.22f);
+                    if (alongX) {
+                        farTerrainAppendBoundsDebugFace(
+                            faces,
+                            visibleFaceCount,
+                            2,
+                            glm::vec3((start + end) * 0.5f, y, fixed),
+                            glm::vec2(length, thickness),
+                            color
+                        );
+                    } else {
+                        farTerrainAppendBoundsDebugFace(
+                            faces,
+                            visibleFaceCount,
+                            2,
+                            glm::vec3(fixed, y, (start + end) * 0.5f),
+                            glm::vec2(thickness, length),
+                            color
+                        );
+                    }
+                }
+            }
+        };
+
+        emitMergedRuns(xRuns, true);
+        emitMergedRuns(zRuns, false);
+    }
+
+    void farTerrainAppendTopFace(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                 size_t& visibleFaceCount,
+                                 const WorldContext& world,
+                                 const std::vector<Entity>& prototypes,
+                                 const FarTerrainCachedCell& cell,
+                                 const std::vector<FarTerrainCachedCell>& cells,
+                                 const std::unordered_map<uint64_t, size_t>& cellIndex) {
+        const int tile = farTerrainMaterialTile(world, prototypes, cell.prototypeName, 2);
+
+        FaceInstanceRenderData face{};
+        face.position = glm::vec3(
+            static_cast<float>(cell.x) + 0.5f * static_cast<float>(cell.size - 1),
+            static_cast<float>(cell.topY) + 0.5f,
+            static_cast<float>(cell.z) + 0.5f * static_cast<float>(cell.size - 1)
+        );
+        face.tileIndex = tile;
+        face.color = farTerrainLitColor(cell, 2, tile >= 0);
+        face.alpha = 1.0f;
+        face.ao = farTerrainTopAo(cell, cells, cellIndex);
+        face.scale = glm::vec2(static_cast<float>(cell.size), static_cast<float>(cell.size));
+        face.uvScale = farTerrainTileUvScale(face.scale);
+        faces[2].push_back(face);
+        visibleFaceCount += 1;
+    }
+
+    void farTerrainAppendVerticalFaceSegment(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                             size_t& visibleFaceCount,
+                                             const WorldContext& world,
+                                             const std::vector<Entity>& prototypes,
+                                             const FarTerrainCachedCell& cell,
+                                             int faceType,
+                                             int bottomY,
+                                             int topY,
+                                             const char* prototypeName,
+                                             const glm::vec3& fallbackColor,
+                                             bool upperContact) {
+        const int heightSpan = topY - bottomY;
+        if (heightSpan <= 0) return;
+
+        const int tile = farTerrainMaterialTile(world, prototypes, prototypeName, faceType);
+        FaceInstanceRenderData face{};
+        face.tileIndex = tile;
+        FarTerrainCachedCell litCell = cell;
+        litCell.fallbackColor = fallbackColor;
+        face.color = farTerrainLitColor(litCell, faceType, tile >= 0);
+        face.alpha = 1.0f;
+        face.ao = farTerrainVerticalAo(heightSpan, upperContact);
+
+        if (faceType == 0) {
+            face.position = glm::vec3(
+                static_cast<float>(cell.x + cell.size - 1) + 0.5f,
+                static_cast<float>(bottomY) + 0.5f * static_cast<float>(heightSpan - 1),
+                static_cast<float>(cell.z) + 0.5f * static_cast<float>(cell.size - 1)
+            );
+            face.scale = glm::vec2(static_cast<float>(cell.size), static_cast<float>(heightSpan));
+        } else if (faceType == 1) {
+            face.position = glm::vec3(
+                static_cast<float>(cell.x) - 0.5f,
+                static_cast<float>(bottomY) + 0.5f * static_cast<float>(heightSpan - 1),
+                static_cast<float>(cell.z) + 0.5f * static_cast<float>(cell.size - 1)
+            );
+            face.scale = glm::vec2(static_cast<float>(cell.size), static_cast<float>(heightSpan));
+        } else if (faceType == 4) {
+            face.position = glm::vec3(
+                static_cast<float>(cell.x) + 0.5f * static_cast<float>(cell.size - 1),
+                static_cast<float>(bottomY) + 0.5f * static_cast<float>(heightSpan - 1),
+                static_cast<float>(cell.z + cell.size - 1) + 0.5f
+            );
+            face.scale = glm::vec2(static_cast<float>(cell.size), static_cast<float>(heightSpan));
+        } else if (faceType == 5) {
+            face.position = glm::vec3(
+                static_cast<float>(cell.x) + 0.5f * static_cast<float>(cell.size - 1),
+                static_cast<float>(bottomY) + 0.5f * static_cast<float>(heightSpan - 1),
+                static_cast<float>(cell.z) - 0.5f
+            );
+            face.scale = glm::vec2(static_cast<float>(cell.size), static_cast<float>(heightSpan));
+        } else {
+            return;
+        }
+
+        face.uvScale = farTerrainTileUvScale(face.scale);
+        faces[static_cast<size_t>(faceType)].push_back(face);
+        visibleFaceCount += 1;
+    }
+
+    void farTerrainAppendVerticalFace(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                      size_t& visibleFaceCount,
+                                      const WorldContext& world,
+                                      const std::vector<Entity>& prototypes,
+                                      const FarTerrainCachedCell& cell,
+                                      int faceType,
+                                      int bottomY,
+                                      bool upperContact) {
+        const int heightSpan = cell.topY - bottomY;
+        if (heightSpan <= 0) return;
+
+        constexpr int kSoilDepthBlocks = 5;
+        const int soilBottomY = std::max(bottomY, cell.topY - kSoilDepthBlocks);
+        if (soilBottomY > bottomY) {
+            farTerrainAppendVerticalFaceSegment(
+                faces,
+                visibleFaceCount,
+                world,
+                prototypes,
+                cell,
+                faceType,
+                bottomY,
+                soilBottomY,
+                cell.deepPrototypeName,
+                cell.deepFallbackColor,
+                false
+            );
+        }
+        farTerrainAppendVerticalFaceSegment(
+            faces,
+            visibleFaceCount,
+            world,
+            prototypes,
+            cell,
+            faceType,
+            soilBottomY,
+            cell.topY,
+            cell.sidePrototypeName,
+            cell.sideFallbackColor,
+            upperContact
+        );
+    }
+
+    struct FarTerrainVerticalRunKey {
+        int faceType = 0;
+        int fixedHalf = 0;
+        int bottomY = 0;
+        int topY = 0;
+        int tileIndex = -1;
+        uint32_t packedColor = 0;
+        bool upperContact = false;
+
+        bool operator==(const FarTerrainVerticalRunKey& other) const noexcept {
+            return faceType == other.faceType
+                && fixedHalf == other.fixedHalf
+                && bottomY == other.bottomY
+                && topY == other.topY
+                && tileIndex == other.tileIndex
+                && packedColor == other.packedColor
+                && upperContact == other.upperContact;
+        }
+    };
+
+    struct FarTerrainVerticalRunKeyHash {
+        size_t operator()(const FarTerrainVerticalRunKey& key) const noexcept {
+            size_t h = std::hash<int>()(key.faceType);
+            h ^= std::hash<int>()(key.fixedHalf) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<int>()(key.bottomY) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<int>()(key.topY) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<int>()(key.tileIndex) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<uint32_t>()(key.packedColor) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= std::hash<int>()(key.upperContact ? 1 : 0) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            return h;
+        }
+    };
+
+    struct FarTerrainVerticalRunInfo {
+        glm::vec3 color = glm::vec3(1.0f);
+    };
+
+    void farTerrainCollectVerticalFaceSegment(
+        std::unordered_map<FarTerrainVerticalRunKey, std::vector<std::pair<int, int>>, FarTerrainVerticalRunKeyHash>& runs,
+        std::unordered_map<FarTerrainVerticalRunKey, FarTerrainVerticalRunInfo, FarTerrainVerticalRunKeyHash>& infos,
+        FarTerrainMaterialTileCache& tileCache,
+        const FarTerrainCachedCell& cell,
+        int faceType,
+        int bottomY,
+        int topY,
+        const char* prototypeName,
+        const glm::vec3& fallbackColor,
+        bool upperContact
+    ) {
+        const int heightSpan = topY - bottomY;
+        if (heightSpan <= 0) return;
+
+        const int tileIndex = tileCache.get(prototypeName, faceType);
+        FarTerrainCachedCell litCell = cell;
+        litCell.fallbackColor = fallbackColor;
+        const glm::vec3 color = farTerrainLitColor(litCell, faceType, tileIndex >= 0);
+
+        int fixedHalf = 0;
+        int runStart = 0;
+        int runEnd = 0;
+        if (faceType == 0) {
+            fixedHalf = 2 * (cell.x + cell.size) - 1;
+            runStart = cell.z;
+            runEnd = cell.z + cell.size;
+        } else if (faceType == 1) {
+            fixedHalf = 2 * cell.x - 1;
+            runStart = cell.z;
+            runEnd = cell.z + cell.size;
+        } else if (faceType == 4) {
+            fixedHalf = 2 * (cell.z + cell.size) - 1;
+            runStart = cell.x;
+            runEnd = cell.x + cell.size;
+        } else if (faceType == 5) {
+            fixedHalf = 2 * cell.z - 1;
+            runStart = cell.x;
+            runEnd = cell.x + cell.size;
+        } else {
+            return;
+        }
+
+        FarTerrainVerticalRunKey key{};
+        key.faceType = faceType;
+        key.fixedHalf = fixedHalf;
+        key.bottomY = bottomY;
+        key.topY = topY;
+        key.tileIndex = tileIndex;
+        key.packedColor = farTerrainPackColor(color);
+        key.upperContact = upperContact;
+        runs[key].push_back({runStart, runEnd});
+        infos.emplace(key, FarTerrainVerticalRunInfo{color});
+    }
+
+    void farTerrainCollectVerticalFace(
+        std::unordered_map<FarTerrainVerticalRunKey, std::vector<std::pair<int, int>>, FarTerrainVerticalRunKeyHash>& runs,
+        std::unordered_map<FarTerrainVerticalRunKey, FarTerrainVerticalRunInfo, FarTerrainVerticalRunKeyHash>& infos,
+        FarTerrainMaterialTileCache& tileCache,
+        const FarTerrainCachedCell& cell,
+        int faceType,
+        int bottomY,
+        bool upperContact
+    ) {
+        const int heightSpan = cell.topY - bottomY;
+        if (heightSpan <= 0) return;
+
+        constexpr int kSoilDepthBlocks = 5;
+        const int soilBottomY = std::max(bottomY, cell.topY - kSoilDepthBlocks);
+        if (soilBottomY > bottomY) {
+            farTerrainCollectVerticalFaceSegment(
+                runs,
+                infos,
+                tileCache,
+                cell,
+                faceType,
+                bottomY,
+                soilBottomY,
+                cell.deepPrototypeName,
+                cell.deepFallbackColor,
+                false
+            );
+        }
+        farTerrainCollectVerticalFaceSegment(
+            runs,
+            infos,
+            tileCache,
+            cell,
+            faceType,
+            soilBottomY,
+            cell.topY,
+            cell.sidePrototypeName,
+            cell.sideFallbackColor,
+            upperContact
+        );
+    }
+
+    void farTerrainAppendMergedVerticalRuns(
+        std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+        size_t& visibleFaceCount,
+        const std::unordered_map<FarTerrainVerticalRunKey, std::vector<std::pair<int, int>>, FarTerrainVerticalRunKeyHash>& runs,
+        const std::unordered_map<FarTerrainVerticalRunKey, FarTerrainVerticalRunInfo, FarTerrainVerticalRunKeyHash>& infos
+    ) {
+        for (const auto& entry : runs) {
+            const FarTerrainVerticalRunKey& key = entry.first;
+            auto infoIt = infos.find(key);
+            if (infoIt == infos.end()) continue;
+
+            std::vector<std::pair<int, int>> intervals = entry.second;
+            if (intervals.empty()) continue;
+            std::sort(intervals.begin(), intervals.end());
+
+            std::vector<std::pair<int, int>> merged;
+            merged.reserve(intervals.size());
+            for (const auto& interval : intervals) {
+                if (merged.empty() || interval.first > merged.back().second) {
+                    merged.push_back(interval);
+                } else {
+                    merged.back().second = std::max(merged.back().second, interval.second);
+                }
+            }
+
+            const int heightSpan = key.topY - key.bottomY;
+            if (heightSpan <= 0) continue;
+            const glm::vec4 ao = farTerrainVerticalAo(heightSpan, key.upperContact);
+
+            for (const auto& interval : merged) {
+                const int runLength = interval.second - interval.first;
+                if (runLength <= 0) continue;
+
+                FaceInstanceRenderData face{};
+                face.tileIndex = key.tileIndex;
+                face.color = infoIt->second.color;
+                face.alpha = 1.0f;
+                face.ao = ao;
+                face.scale = glm::vec2(static_cast<float>(runLength), static_cast<float>(heightSpan));
+                face.uvScale = farTerrainTileUvScale(face.scale);
+
+                const float fixedCoord = static_cast<float>(key.fixedHalf) * 0.5f;
+                const float runCenter = static_cast<float>(interval.first) + 0.5f * static_cast<float>(runLength - 1);
+                const float yCenter = static_cast<float>(key.bottomY) + 0.5f * static_cast<float>(heightSpan - 1);
+
+                if (key.faceType == 0 || key.faceType == 1) {
+                    face.position = glm::vec3(fixedCoord, yCenter, runCenter);
+                } else if (key.faceType == 4 || key.faceType == 5) {
+                    face.position = glm::vec3(runCenter, yCenter, fixedCoord);
+                } else {
+                    continue;
+                }
+
+                faces[static_cast<size_t>(key.faceType)].push_back(face);
+                visibleFaceCount += 1;
+            }
+        }
+    }
+
+    void farTerrainAppendCellFaces(std::array<std::vector<FaceInstanceRenderData>, 6>& faces,
+                                   size_t& visibleFaceCount,
+                                   const WorldContext& world,
+                                   const std::vector<Entity>& prototypes,
+                                   const std::vector<FarTerrainCachedCell>& cells,
+                                   int skirtDepth,
+                                   int waterFloorY,
+                                   bool boundsDebugEnabled,
+                                   FarTerrainBuildPerfStats* perfStats = nullptr) {
+        std::unordered_map<uint64_t, size_t> cellIndex;
+        cellIndex.reserve(cells.size() * 2);
+        for (size_t i = 0; i < cells.size(); ++i) {
+            cellIndex.emplace(farTerrainCellKey(cells[i].x, cells[i].z), i);
+        }
+
+        if (boundsDebugEnabled) {
+            farTerrainAppendMergedBoundsDebugRuns(faces, visibleFaceCount, cells, cellIndex);
+        }
+
+        FarTerrainMaterialTileCache tileCache(world, prototypes);
+        std::unordered_map<int, std::vector<FarTerrainCachedCell>> greedyTopGroups;
+        greedyTopGroups.reserve(4);
+        for (const FarTerrainCachedCell& cell : cells) {
+            if (cell.size > 0) {
+                greedyTopGroups[cell.size].push_back(cell);
+            }
+        }
+
+        for (const auto& entry : greedyTopGroups) {
+            farTerrainAppendGreedyTopFaces(
+                faces,
+                visibleFaceCount,
+                tileCache,
+                entry.second,
+                cellIndex,
+                entry.first,
+                perfStats
+            );
+        }
+
+        std::unordered_map<FarTerrainVerticalRunKey, std::vector<std::pair<int, int>>, FarTerrainVerticalRunKeyHash> verticalRuns;
+        std::unordered_map<FarTerrainVerticalRunKey, FarTerrainVerticalRunInfo, FarTerrainVerticalRunKeyHash> verticalRunInfos;
+        verticalRuns.reserve(cells.size() * 4);
+        verticalRunInfos.reserve(cells.size() * 4);
+        const auto verticalStart = std::chrono::steady_clock::now();
+
+        for (const FarTerrainCachedCell& cell : cells) {
+            const auto appendEdge = [&](int faceType, int neighborX, int neighborZ) {
+                int targetBottom = std::max(waterFloorY, cell.topY - skirtDepth);
+                bool upperContact = false;
+                auto it = cellIndex.find(farTerrainCellKey(neighborX, neighborZ));
+                if (it != cellIndex.end()) {
+                    const FarTerrainCachedCell& neighbor = cells[it->second];
+                    targetBottom = std::max(targetBottom, neighbor.topY);
+                    upperContact = neighbor.topY >= cell.topY - 1;
+                }
+                farTerrainCollectVerticalFace(
+                    verticalRuns,
+                    verticalRunInfos,
+                    tileCache,
+                    cell,
+                    faceType,
+                    targetBottom,
+                    upperContact
+                );
+            };
+
+            appendEdge(0, cell.x + cell.size, cell.z);
+            appendEdge(1, cell.x - cell.size, cell.z);
+            appendEdge(4, cell.x, cell.z + cell.size);
+            appendEdge(5, cell.x, cell.z - cell.size);
+        }
+
+        farTerrainAppendMergedVerticalRuns(
+            faces,
+            visibleFaceCount,
+            verticalRuns,
+            verticalRunInfos
+        );
+        if (perfStats) {
+            perfStats->verticalBuildMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - verticalStart
+            ).count();
+        }
+    }
+
+    bool farTerrainSectionHasRealMesh(const BaseSystem& baseSystem, const VoxelSectionKey& key) {
+        if (!baseSystem.voxelWorld || !baseSystem.voxelRender) return false;
+        const VoxelChunkLifecycleState* state = baseSystem.voxelWorld->findChunkState(key);
+        if (!state || !state->isRenderable()) return false;
+        return baseSystem.voxelRender->renderBuffers.count(key) > 0;
+    }
+
+    bool farTerrainCellCoveredByRealTerrain(const BaseSystem& baseSystem,
+                                            const FarTerrainCachedCell& cell,
+                                            int sectionSize,
+                                            std::unordered_map<VoxelSectionKey, bool, VoxelSectionKeyHash>* coverageCache = nullptr) {
+        if (!baseSystem.voxelWorld || !baseSystem.voxelRender || sectionSize <= 0) return false;
+
+        const int minSectionX = farTerrainFloorDivInt(cell.x, sectionSize);
+        const int maxSectionX = farTerrainFloorDivInt(cell.x + cell.size - 1, sectionSize);
+        const int minSectionZ = farTerrainFloorDivInt(cell.z, sectionSize);
+        const int maxSectionZ = farTerrainFloorDivInt(cell.z + cell.size - 1, sectionSize);
+        const int surfaceSectionY = farTerrainFloorDivInt(cell.topY, sectionSize);
+
+        for (int sz = minSectionZ; sz <= maxSectionZ; ++sz) {
+            for (int sx = minSectionX; sx <= maxSectionX; ++sx) {
+                const VoxelSectionKey surfaceKey{glm::ivec3(sx, surfaceSectionY, sz)};
+                bool covered = false;
+                if (coverageCache) {
+                    auto cached = coverageCache->find(surfaceKey);
+                    if (cached != coverageCache->end()) {
+                        covered = cached->second;
+                    } else {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            const VoxelSectionKey key{glm::ivec3(sx, surfaceSectionY + dy, sz)};
+                            if (farTerrainSectionHasRealMesh(baseSystem, key)) {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        coverageCache->emplace(surfaceKey, covered);
+                    }
+                } else {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        const VoxelSectionKey key{glm::ivec3(sx, surfaceSectionY + dy, sz)};
+                        if (farTerrainSectionHasRealMesh(baseSystem, key)) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                }
+                if (!covered) return false;
+            }
+        }
+        return true;
+    }
+
+    uint64_t farTerrainBoundaryCoverageSignature(const BaseSystem& baseSystem,
+                                                 const glm::ivec2& anchor,
+                                                 int nearRadiusBlocks,
+                                                 int baseCellSize,
+                                                 int sectionSize) {
+        if (!baseSystem.voxelWorld || !baseSystem.voxelRender || sectionSize <= 0) return 0;
+
+        const int bandInner = 0;
+        constexpr int kCoverageHandoffRadialCells = 4;
+        const int handoffBandWidth = std::max(baseCellSize, baseCellSize * kCoverageHandoffRadialCells);
+        const int bandOuter = std::max(sectionSize * 2, std::max(0, nearRadiusBlocks) + handoffBandWidth + sectionSize);
+        uint64_t signature = 1469598103934665603ull;
+        size_t includedCount = 0;
+
+        for (const auto& entry : baseSystem.voxelRender->renderBuffers) {
+            const VoxelSectionKey& key = entry.first;
+            const VoxelChunkLifecycleState* state = baseSystem.voxelWorld->findChunkState(key);
+            if (!state || !state->isRenderable()) continue;
+
+            const int sectionCenterX = key.coord.x * sectionSize + sectionSize / 2;
+            const int sectionCenterZ = key.coord.z * sectionSize + sectionSize / 2;
+            const int dx = std::abs(sectionCenterX - anchor.x);
+            const int dz = std::abs(sectionCenterZ - anchor.y);
+            const int chebyshev = std::max(dx, dz);
+            if (chebyshev < bandInner || chebyshev > bandOuter) continue;
+
+            signature = farTerrainHashMix(signature, key.coord.x);
+            signature = farTerrainHashMix(signature, key.coord.y);
+            signature = farTerrainHashMix(signature, key.coord.z);
+            includedCount += 1;
+        }
+
+        signature = farTerrainHashMix(signature, static_cast<int>(includedCount & 0x7fffffffu));
+        return signature;
+    }
+
+    void farTerrainRefreshHandoffFaces(BaseSystem& baseSystem,
+                                       const WorldContext& world,
+                                       const std::vector<Entity>& prototypes,
+                                       FarTerrainClipmapContext& ctx,
+                                       int skirtDepth,
+                                       int waterFloorY,
+                                       int voxelSectionSize,
+                                       bool hideWhenRealTerrainReady,
+                                       bool boundsDebugEnabled,
+                                       size_t* outSuppressedCellCount = nullptr,
+                                       FarTerrainBuildPerfStats* perfStats = nullptr) {
+        farTerrainClearFaceSet(ctx.handoffFaces, ctx.handoffVisibleFaceCount);
+        std::vector<FarTerrainCachedCell> visibleCells;
+        visibleCells.reserve(ctx.handoffCells.size());
+        std::unordered_map<VoxelSectionKey, bool, VoxelSectionKeyHash> coverageCache;
+        if (hideWhenRealTerrainReady) {
+            coverageCache.reserve(std::max<size_t>(64, ctx.handoffCells.size() / 4));
+        }
+        size_t suppressedCellCount = 0;
+        const int worldMinY = static_cast<int>(std::floor(world.expanse.minY));
+        for (const FarTerrainCachedCell& cell : ctx.handoffCells) {
+            ctx.sectorCellTests += 1;
+            if (!farTerrainHorizontalSectorVisible(
+                    baseSystem,
+                    cell.x,
+                    cell.z,
+                    cell.x + cell.size,
+                    cell.z + cell.size
+                )) {
+                ctx.sectorCellRejected += 1;
+                continue;
+            }
+            ctx.frustumCellTests += 1;
+            const int cellBottomY = std::max(worldMinY, std::max(waterFloorY, cell.topY - skirtDepth));
+            if (!farTerrainConservativeAabbVisible(
+                    baseSystem,
+                    cell.x,
+                    cellBottomY,
+                    cell.z,
+                    cell.x + cell.size,
+                    cell.topY + 1,
+                    cell.z + cell.size
+                )) {
+                ctx.frustumCellRejected += 1;
+                continue;
+            }
+            if (hideWhenRealTerrainReady
+                && farTerrainCellCoveredByRealTerrain(baseSystem, cell, voxelSectionSize, &coverageCache)) {
+                suppressedCellCount += 1;
+                continue;
+            }
+            visibleCells.push_back(cell);
+        }
+        farTerrainAppendCellFaces(
+            ctx.handoffFaces,
+            ctx.handoffVisibleFaceCount,
+            world,
+            prototypes,
+            visibleCells,
+            skirtDepth,
+            waterFloorY,
+            boundsDebugEnabled,
+            perfStats
+        );
+        ctx.handoffRenderBuffersDirty = true;
+        farTerrainSyncVisibleFaceCount(ctx);
+        if (outSuppressedCellCount) *outSuppressedCellCount = suppressedCellCount;
+    }
+}
+
+namespace FarTerrainClipmapSystemLogic {
+    void UpdateFarTerrainClipmap(BaseSystem& baseSystem, std::vector<Entity>& prototypes, float, PlatformWindowHandle) {
+        if (!baseSystem.farTerrain || !baseSystem.world || !baseSystem.player) return;
+
+        FarTerrainClipmapContext& ctx = *baseSystem.farTerrain;
+        WorldContext& world = *baseSystem.world;
+        const auto updateStart = std::chrono::steady_clock::now();
+        const bool enabled = true;
+        if (!enabled || !world.expanse.loaded) {
+            if (ctx.enabled || ctx.visibleFaceCount > 0 || ctx.handoffRenderBuffersValid || ctx.bodyRenderBuffersValid) {
+                farTerrainClearAllFaces(ctx);
+                ctx.handoffCells.clear();
+                ctx.resolvedCellCache.clear();
+                farTerrainDestroyRenderBuffers(baseSystem, ctx);
+            }
+            ctx.enabled = false;
+            ctx.lastBuildSkipped = true;
+            ctx.lastSetupMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - updateStart
+            ).count();
+            ctx.lastBodyBuildMs = 0.0f;
+            ctx.lastHandoffBuildMs = 0.0f;
+            ctx.lastUploadMs = 0.0f;
+            ctx.lastCellResolveMs = 0.0f;
+            ctx.lastTopGreedyMs = 0.0f;
+            ctx.lastTopMergeMs = 0.0f;
+            ctx.lastVerticalBuildMs = 0.0f;
+            ctx.lastClusterPrepMs = 0.0f;
+            ctx.lastClusterUploadMs = 0.0f;
+            ctx.lastUpdateMs = ctx.lastSetupMs;
+            return;
+        }
+
+        constexpr int kSectionSizeBlocks = 16;
+        constexpr int kNormalDetailRadiusChunks = 6;
+        constexpr int kNearProxyRadiusBlocks = kNormalDetailRadiusChunks * kSectionSizeBlocks;
+        constexpr int kFirstLodCellBlocks = 2;
+        constexpr int kRingRadialCells = 4;
+        constexpr int kRingCount = 10;
+        constexpr int kSkirtDepthBlocks = 96;
+        constexpr int kRebuildIntervalFrames = 90;
+        constexpr int kForwardBiasBlocks = 96;
+        constexpr float kFrustumViewBucketDegrees = 45.0f;
+        constexpr int kMaxRadiusBlocks =
+            kNearProxyRadiusBlocks
+            + (kFirstLodCellBlocks * kRingRadialCells)
+            + (kFirstLodCellBlocks * 2 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 4 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 8 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 16 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 32 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 64 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 128 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 256 * kRingRadialCells)
+            + (kFirstLodCellBlocks * 512 * kRingRadialCells);
+        const int baseCell = kFirstLodCellBlocks;
+        const int nearRadius = kNearProxyRadiusBlocks;
+        const int maxRadius = kMaxRadiusBlocks;
+        const int ringCount = kRingCount;
+        const int skirtDepth = kSkirtDepthBlocks;
+        const int rebuildIntervalFrames = kRebuildIntervalFrames;
+        const int forwardBiasBlocks = kForwardBiasBlocks;
+        constexpr bool kHideWhenRealTerrainReady = true;
+        constexpr bool kDebugLog = false;
+        const bool hideWhenRealTerrainReady = kHideWhenRealTerrainReady;
+        const bool debugLog = kDebugLog;
+        const bool boundsDebugEnabled = farTerrainGetRegistryBool(
+            baseSystem,
+            "FarTerrainLodBoundsDebugEnabled",
+            false
+        );
+        const int anchorStep = std::max(
+            baseCell,
+            ((std::max(baseCell * 4, nearRadius / 2) + baseCell - 1) / baseCell) * baseCell
+        );
+        const int waterFloorY = static_cast<int>(std::floor(world.expanse.waterFloor));
+        const int conservativeMinY = std::min(
+            static_cast<int>(std::floor(world.expanse.minY)),
+            waterFloorY - kSkirtDepthBlocks
+        );
+        const int conservativeMaxY = farTerrainConservativeMaxY(baseSystem, world);
+        const int voxelSectionSize = (baseSystem.voxelWorld && baseSystem.voxelWorld->sectionSize > 0)
+            ? baseSystem.voxelWorld->sectionSize
+            : 16;
+        ctx.sectorRingTests = 0;
+        ctx.sectorRingRejected = 0;
+        ctx.sectorCellTests = 0;
+        ctx.sectorCellRejected = 0;
+        ctx.frustumRingTests = 0;
+        ctx.frustumRingRejected = 0;
+        ctx.frustumCellTests = 0;
+        ctx.frustumCellRejected = 0;
+        const bool frustumFrozen = FrustumCullingSystemLogic::IsDebugFrozen(baseSystem);
+        const glm::vec3 cameraPos = FrustumCullingSystemLogic::GetCullingCameraPosition(baseSystem);
+        const glm::vec3 prevCameraPos = FrustumCullingSystemLogic::GetCullingPreviousCameraPosition(baseSystem);
+        const int viewYawBucket = farTerrainAngleBucket(
+            FrustumCullingSystemLogic::GetCullingCameraYaw(baseSystem),
+            kFrustumViewBucketDegrees,
+            180.0f
+        );
+        const int viewPitchBucket = farTerrainAngleBucket(
+            FrustumCullingSystemLogic::GetCullingCameraPitch(baseSystem),
+            kFrustumViewBucketDegrees,
+            90.0f
+        );
+        glm::vec2 forwardXZ(
+            cameraPos.x - prevCameraPos.x,
+            cameraPos.z - prevCameraPos.z
+        );
+        if (glm::dot(forwardXZ, forwardXZ) > 0.0025f) {
+            forwardXZ = glm::normalize(forwardXZ);
+        } else {
+            forwardXZ = glm::vec2(0.0f, 0.0f);
+        }
+        const glm::ivec2 anchor(
+            farTerrainFloorToMultiple(cameraPos.x + forwardXZ.x * static_cast<float>(forwardBiasBlocks), anchorStep),
+            farTerrainFloorToMultiple(cameraPos.z + forwardXZ.y * static_cast<float>(forwardBiasBlocks), anchorStep)
+        );
+        const uint64_t boundaryCoverageSignature = farTerrainBoundaryCoverageSignature(
+            baseSystem,
+            anchor,
+            nearRadius,
+            baseCell,
+            voxelSectionSize
+        );
+
+        const bool paramsChanged =
+            !ctx.initialized
+            || ctx.baseCellSize != baseCell
+            || ctx.nearRadiusBlocks != nearRadius
+            || ctx.maxRadiusBlocks != maxRadius
+            || ctx.ringCount != ringCount
+            || ctx.boundsDebugEnabled != boundsDebugEnabled;
+        const bool anchorChanged = !frustumFrozen && (ctx.anchorCell != anchor);
+        const glm::ivec2 anchorDelta = anchor - ctx.anchorCell;
+        const bool realMeshCoverageChanged =
+            ctx.initialized
+            && !frustumFrozen
+            && (ctx.lastBoundaryCoverageSignature != boundaryCoverageSignature);
+        const bool viewBucketChanged =
+            !ctx.initialized
+            || (!frustumFrozen && (
+                ctx.lastViewYawBucket != viewYawBucket
+                || ctx.lastViewPitchBucket != viewPitchBucket
+            ));
+        const bool periodicRefreshDue =
+            !ctx.initialized
+            || (!frustumFrozen && (baseSystem.frameIndex >= ctx.lastBuildFrame + static_cast<uint64_t>(rebuildIntervalFrames)));
+        const int handoffCoverageRefreshIntervalFrames = std::max(
+            1,
+            farTerrainGetRegistryInt(baseSystem, "FarTerrainHandoffCoverageRefreshIntervalFrames", 30)
+        );
+        const bool coverageRefreshDue =
+            realMeshCoverageChanged
+            && (!frustumFrozen && (
+                !ctx.initialized
+                || baseSystem.frameIndex >= ctx.lastBuildFrame + static_cast<uint64_t>(handoffCoverageRefreshIntervalFrames)
+            ));
+        const bool fullRebuildNeeded = paramsChanged || anchorChanged || viewBucketChanged;
+        const bool handoffRefreshNeeded =
+            !fullRebuildNeeded
+            && ((realMeshCoverageChanged && coverageRefreshDue) || periodicRefreshDue);
+        ctx.lastParamsChanged = paramsChanged;
+        ctx.lastAnchorChanged = anchorChanged;
+        ctx.lastCoverageChanged = realMeshCoverageChanged;
+        ctx.lastPeriodicRefreshDue = periodicRefreshDue;
+        ctx.lastViewBucketChanged = viewBucketChanged;
+        ctx.lastAnchorDeltaX = anchorDelta.x;
+        ctx.lastAnchorDeltaZ = anchorDelta.y;
+        const auto setupEnd = std::chrono::steady_clock::now();
+        ctx.lastSetupMs = std::chrono::duration<float, std::milli>(
+            setupEnd - updateStart
+        ).count();
+        ctx.lastCellResolveMs = 0.0f;
+        ctx.lastTopGreedyMs = 0.0f;
+        ctx.lastTopMergeMs = 0.0f;
+        ctx.lastVerticalBuildMs = 0.0f;
+        ctx.lastClusterPrepMs = 0.0f;
+        ctx.lastClusterUploadMs = 0.0f;
+        FarTerrainBuildPerfStats perfStats{};
+        if (!fullRebuildNeeded
+            && !handoffRefreshNeeded
+            && ctx.enabled) {
+            ctx.lastFullRebuild = false;
+            ctx.lastHandoffRefresh = false;
+            const auto uploadStart = std::chrono::steady_clock::now();
+            farTerrainUploadRenderBuffers(baseSystem, ctx, &perfStats);
+            ctx.uploadOnlyCount += 1;
+            ctx.lastBodyBuildMs = 0.0f;
+            ctx.lastHandoffBuildMs = 0.0f;
+            ctx.lastUploadMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - uploadStart
+            ).count();
+            ctx.lastCellResolveMs = static_cast<float>(perfStats.cellResolveMs);
+            ctx.lastTopGreedyMs = static_cast<float>(perfStats.topGreedyMs);
+            ctx.lastTopMergeMs = static_cast<float>(perfStats.topMergeMs);
+            ctx.lastVerticalBuildMs = static_cast<float>(perfStats.verticalBuildMs);
+            ctx.lastClusterPrepMs = static_cast<float>(perfStats.clusterPrepMs);
+            ctx.lastClusterUploadMs = static_cast<float>(perfStats.clusterUploadMs);
+            ctx.lastUpdateMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - updateStart
+            ).count();
+            return;
+        }
+
+        ctx.enabled = true;
+        ctx.initialized = true;
+        ctx.lastBuildSkipped = false;
+        ctx.lastBoundaryCoverageSignature = boundaryCoverageSignature;
+        ctx.boundsDebugEnabled = boundsDebugEnabled;
+        ctx.lastViewYawBucket = viewYawBucket;
+        ctx.lastViewPitchBucket = viewPitchBucket;
+        size_t suppressedCellCount = 0;
+        ctx.lastFullRebuild = fullRebuildNeeded;
+        ctx.lastHandoffRefresh = handoffRefreshNeeded;
+        ctx.lastBodyBuildMs = 0.0f;
+        ctx.lastHandoffBuildMs = 0.0f;
+        if (fullRebuildNeeded) {
+            if (paramsChanged) ctx.fullRebuildByParamsCount += 1;
+            if (anchorChanged) ctx.fullRebuildByAnchorCount += 1;
+            if (viewBucketChanged) ctx.fullRebuildByViewCount += 1;
+        }
+
+        if (handoffRefreshNeeded && ctx.enabled) {
+            ctx.handoffRefreshCount += 1;
+            if (realMeshCoverageChanged) ctx.handoffRefreshByCoverageCount += 1;
+            if (periodicRefreshDue) ctx.handoffRefreshByPeriodicCount += 1;
+            const auto handoffStart = std::chrono::steady_clock::now();
+            farTerrainRefreshHandoffFaces(
+                baseSystem,
+                world,
+                prototypes,
+                ctx,
+                skirtDepth,
+                waterFloorY,
+                voxelSectionSize,
+                hideWhenRealTerrainReady,
+                boundsDebugEnabled,
+                &suppressedCellCount,
+                &perfStats
+            );
+            ctx.lastHandoffBuildMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - handoffStart
+            ).count();
+            ctx.lastBuildFrame = baseSystem.frameIndex;
+            ctx.lastSuppressedCellCount = suppressedCellCount;
+            ctx.lastHandoffCellCount = ctx.handoffCells.size();
+            ctx.lastBodyCellCount = 0;
+            for (size_t i = 0; i < ctx.lodCellCounts.size(); ++i) {
+                if (i > 0) ctx.lastBodyCellCount += ctx.lodCellCounts[i];
+            }
+        } else {
+            farTerrainClearAllFaces(ctx);
+            ctx.handoffCells.clear();
+            ctx.bodyCells.clear();
+            ctx.anchorCell = anchor;
+            ctx.baseCellSize = baseCell;
+            ctx.nearRadiusBlocks = nearRadius;
+            ctx.maxRadiusBlocks = maxRadius;
+            ctx.ringCount = ringCount;
+            ctx.visibleRingCount = ringCount;
+            ctx.rebuildCount += 1;
+            ctx.lastBuildFrame = baseSystem.frameIndex;
+            ctx.handoffRenderBuffersDirty = true;
+            ctx.bodyRenderBuffersDirty = true;
+            ctx.lodCellCounts.fill(0);
+            ctx.lodFaceCounts.fill(0);
+            ctx.lodTriangleCounts.fill(0);
+            constexpr size_t kMaxResolvedCellCacheEntries = 65536;
+            if (paramsChanged || ctx.resolvedCellCache.size() > kMaxResolvedCellCacheEntries) {
+                ctx.resolvedCellCache.clear();
+            }
+
+            const auto bodyBuildStart = std::chrono::steady_clock::now();
+            const int handoffBandWidth = kFirstLodCellBlocks * kRingRadialCells;
+            const int handoffOuterRadius = std::min(maxRadius, nearRadius + handoffBandWidth);
+            FarTerrainHydrologySampler hydrologySampler = farTerrainCreateHydrologySampler(baseSystem, world);
+
+            int innerRadius = 0;
+            for (int ring = 0; ring < ctx.visibleRingCount && innerRadius < maxRadius; ++ring) {
+                const int cellSize = kFirstLodCellBlocks << ring;
+                const int targetOuter = innerRadius
+                    + cellSize * kRingRadialCells
+                    + (ring == 0 ? nearRadius : 0);
+                const int outerRadius = (ring == ringCount - 1)
+                    ? maxRadius
+                    : std::min(maxRadius, targetOuter);
+                const int minX = farTerrainFloorToMultiple(static_cast<float>(anchor.x - outerRadius), cellSize);
+                const int maxX = farTerrainFloorToMultiple(static_cast<float>(anchor.x + outerRadius), cellSize);
+                const int minZ = farTerrainFloorToMultiple(static_cast<float>(anchor.y - outerRadius), cellSize);
+                const int maxZ = farTerrainFloorToMultiple(static_cast<float>(anchor.y + outerRadius), cellSize);
+                ctx.sectorRingTests += 1;
+                if (!farTerrainHorizontalSectorVisible(
+                        baseSystem,
+                        minX,
+                        minZ,
+                        maxX + cellSize,
+                        maxZ + cellSize
+                    )) {
+                    ctx.sectorRingRejected += 1;
+                    innerRadius = outerRadius;
+                    continue;
+                }
+                ctx.frustumRingTests += 1;
+                if (!farTerrainConservativeAabbVisible(
+                        baseSystem,
+                        minX,
+                        conservativeMinY,
+                        minZ,
+                        maxX + cellSize,
+                        conservativeMaxY,
+                        maxZ + cellSize
+                    )) {
+                    ctx.frustumRingRejected += 1;
+                    innerRadius = outerRadius;
+                    continue;
+                }
+                std::vector<FarTerrainCachedCell> visibleBodyCells;
+                const auto cellResolveStart = std::chrono::steady_clock::now();
+
+                for (int z = minZ; z <= maxZ; z += cellSize) {
+                    for (int x = minX; x <= maxX; x += cellSize) {
+                        const float centerX = static_cast<float>(x) + 0.5f * static_cast<float>(cellSize);
+                        const float centerZ = static_cast<float>(z) + 0.5f * static_cast<float>(cellSize);
+                        const float dx = std::abs(centerX - static_cast<float>(anchor.x));
+                        const float dz = std::abs(centerZ - static_cast<float>(anchor.y));
+                        const float chebyshev = std::max(dx, dz);
+                        if (chebyshev <= static_cast<float>(innerRadius) || chebyshev > static_cast<float>(outerRadius)) {
+                            continue;
+                        }
+                        ctx.sectorCellTests += 1;
+                        if (!farTerrainHorizontalSectorVisible(
+                                baseSystem,
+                                x,
+                                z,
+                                x + cellSize,
+                                z + cellSize
+                            )) {
+                            ctx.sectorCellRejected += 1;
+                            continue;
+                        }
+                        ctx.frustumCellTests += 1;
+                        if (!farTerrainConservativeAabbVisible(
+                                baseSystem,
+                                x,
+                                conservativeMinY,
+                                z,
+                                x + cellSize,
+                                conservativeMaxY,
+                                z + cellSize
+                            )) {
+                            ctx.frustumCellRejected += 1;
+                            continue;
+                        }
+
+                        const uint64_t resolveCacheKey = farTerrainCellResolveCacheKey(x, z, cellSize);
+                        FarTerrainCachedCell cell{};
+                        auto cachedCell = ctx.resolvedCellCache.find(resolveCacheKey);
+                        if (cachedCell != ctx.resolvedCellCache.end()) {
+                            cell = cachedCell->second;
+                            cell.lodRing = ring;
+                        } else {
+                            float height = 0.0f;
+                            const bool isLand = ExpanseBiomeSystemLogic::SampleTerrain(world, centerX, centerZ, height);
+                            const int rawSurfaceY = static_cast<int>(std::floor(height));
+                            const int resolvedSurfaceY = isLand
+                                ? farTerrainHydrologySurfaceY(
+                                    hydrologySampler,
+                                    world,
+                                    centerX,
+                                    centerZ,
+                                    isLand,
+                                    rawSurfaceY
+                                )
+                                : waterFloorY;
+
+                            const int biome = isLand
+                                ? ExpanseBiomeSystemLogic::ResolveBiome(world, centerX, centerZ)
+                                : -1;
+                            const FarTerrainMaterial material = isLand
+                                ? farTerrainMaterialForBiome(world, biome)
+                                : farTerrainSeabedMaterialForSample(world);
+                            const FarTerrainMaterial sideMaterial = isLand
+                                ? farTerrainSideMaterialForBiome(world, biome)
+                                : farTerrainSeabedMaterialForSample(world);
+                            const FarTerrainMaterial deepMaterial = farTerrainDeepMaterialForSample(world);
+                            cell.x = x;
+                            cell.z = z;
+                            cell.size = cellSize;
+                            cell.topY = std::max(resolvedSurfaceY, waterFloorY);
+                            cell.lodRing = ring;
+                            cell.prototypeName = material.prototypeName ? material.prototypeName : "GrassBlockTex";
+                            cell.sidePrototypeName = sideMaterial.prototypeName ? sideMaterial.prototypeName : "DirtBlockTex";
+                            cell.deepPrototypeName = deepMaterial.prototypeName ? deepMaterial.prototypeName : "StoneBlockTex";
+                            cell.fallbackColor = material.fallbackColor;
+                            cell.sideFallbackColor = sideMaterial.fallbackColor;
+                            cell.deepFallbackColor = deepMaterial.fallbackColor;
+                            ctx.resolvedCellCache.emplace(resolveCacheKey, cell);
+                        }
+                        ctx.lastLandCellCount += 1;
+                        if (ring >= 0 && ring < static_cast<int>(ctx.lodCellCounts.size())) {
+                            ctx.lodCellCounts[static_cast<size_t>(ring)] += 1;
+                        }
+
+                        if (chebyshev <= static_cast<float>(handoffOuterRadius)) {
+                            ctx.handoffCells.push_back(cell);
+                        } else {
+                            ctx.bodyCells.push_back(cell);
+                            visibleBodyCells.push_back(cell);
+                        }
+                    }
+                }
+                perfStats.cellResolveMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cellResolveStart
+                ).count();
+
+                if (!visibleBodyCells.empty()) {
+                    const size_t facesBefore = ctx.bodyVisibleFaceCount;
+                    farTerrainAppendCellFaces(
+                        ctx.bodyFaces,
+                        ctx.bodyVisibleFaceCount,
+                        world,
+                        prototypes,
+                        visibleBodyCells,
+                        skirtDepth,
+                        waterFloorY,
+                        boundsDebugEnabled,
+                        &perfStats
+                    );
+                    if (ring >= 0 && ring < static_cast<int>(ctx.lodFaceCounts.size())) {
+                        const size_t faceDelta = ctx.bodyVisibleFaceCount - facesBefore;
+                        ctx.lodFaceCounts[static_cast<size_t>(ring)] += faceDelta;
+                        ctx.lodTriangleCounts[static_cast<size_t>(ring)] += faceDelta * 2u;
+                    }
+                }
+                innerRadius = outerRadius;
+            }
+            ctx.lastBodyBuildMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - bodyBuildStart
+            ).count();
+
+            size_t handoffSuppressedCellCount = 0;
+            const auto handoffStart = std::chrono::steady_clock::now();
+            farTerrainRefreshHandoffFaces(
+                baseSystem,
+                world,
+                prototypes,
+                ctx,
+                skirtDepth,
+                waterFloorY,
+                voxelSectionSize,
+                hideWhenRealTerrainReady,
+                boundsDebugEnabled,
+                &handoffSuppressedCellCount,
+                &perfStats
+            );
+            ctx.lastHandoffBuildMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - handoffStart
+            ).count();
+            ctx.lastSuppressedCellCount = suppressedCellCount + handoffSuppressedCellCount;
+            ctx.lastHandoffCellCount = ctx.handoffCells.size();
+            ctx.lastBodyCellCount = ctx.lastLandCellCount >= ctx.lastHandoffCellCount
+                ? (ctx.lastLandCellCount - ctx.lastHandoffCellCount)
+                : 0;
+        }
+
+        if (debugLog) {
+            std::cout << "[FarTerrain] rebuild=" << ctx.rebuildCount
+                      << " faces=" << ctx.visibleFaceCount
+                      << " handoffFaces=" << ctx.handoffVisibleFaceCount
+                      << " bodyFaces=" << ctx.bodyVisibleFaceCount
+                      << " landCells=" << ctx.lastLandCellCount
+                      << " handoffCells=" << ctx.lastHandoffCellCount
+                      << " bodyCells=" << ctx.lastBodyCellCount
+                      << " suppressed=" << ctx.lastSuppressedCellCount
+                      << " anchor=(" << ctx.anchorCell.x << "," << ctx.anchorCell.y << ")"
+                      << " near=" << ctx.nearRadiusBlocks
+                      << " max=" << ctx.maxRadiusBlocks
+                      << " rings=" << ctx.ringCount
+                      << " visibleRings=" << ctx.visibleRingCount
+                      << std::endl;
+        }
+        const auto uploadStart = std::chrono::steady_clock::now();
+        farTerrainUploadRenderBuffers(baseSystem, ctx, &perfStats);
+        ctx.lastUploadMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - uploadStart
+        ).count();
+        ctx.lastCellResolveMs = static_cast<float>(perfStats.cellResolveMs);
+        ctx.lastTopGreedyMs = static_cast<float>(perfStats.topGreedyMs);
+        ctx.lastTopMergeMs = static_cast<float>(perfStats.topMergeMs);
+        ctx.lastVerticalBuildMs = static_cast<float>(perfStats.verticalBuildMs);
+        ctx.lastClusterPrepMs = static_cast<float>(perfStats.clusterPrepMs);
+        ctx.lastClusterUploadMs = static_cast<float>(perfStats.clusterUploadMs);
+        ctx.lastUpdateMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - updateStart
+        ).count();
+    }
+}
